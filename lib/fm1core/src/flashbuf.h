@@ -22,7 +22,6 @@ class FlashBuf {
   bool inMemory() const { return mem; }
   bool write(uint32_t at, const uint8_t* p, uint32_t len);
   bool read(uint32_t at, uint8_t* p, uint32_t len) const;
-  bool sha256(char hex[65]) const;
   // all of it into a file; between each 32 KB, between() if it's given (uboot::keepAlive: the SD card can be slow)
   bool saveTo(const char* path, void (*between)()) const;
 

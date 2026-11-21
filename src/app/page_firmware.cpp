@@ -843,7 +843,7 @@ static void install(lv_event_t* e) {
     lv_label_set_text(l, sure);
     return;
   }
-  if (!jobs::install(sel)) {
+  if (!jobs::install(sel, false)) {
     toast("Busy: try again in a moment.", true);
   }
   showProgress();

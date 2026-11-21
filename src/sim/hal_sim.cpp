@@ -18,6 +18,8 @@
 
 #include "fake.h"
 #include "hal.h"
+#include "memory.h"
+#include "watchdog.h"
 
 static bool wifi;
 
@@ -32,6 +34,7 @@ void hal::logRam(const char*) {}
 void hal::psramFirst(bool) {}
 
 void hal::idle() {
+  watchdog::waited();
   std::this_thread::yield();
 }
 
@@ -340,6 +343,7 @@ bool hal::sha256(const char* path, char hex[65]) {
   uint8_t buf[4096];
   for (size_t n; (n = fread(buf, 1, sizeof buf, f));) {
     CC_SHA256_Update(&ctx, buf, (CC_LONG)n);
+    sdPace(n);
   }
   fclose(f);
   uint8_t sum[32];
@@ -351,7 +355,10 @@ bool hal::sha256(const char* path, char hex[65]) {
 }
 
 void hal::spawn(void (*fn)(void*), void* arg, uint32_t, int) {
-  std::thread(fn, arg).detach();
+  std::thread([fn, arg] {
+    watchdog::jobThread();
+    fn(arg);
+  }).detach();
 }
 
 // ------------------------------------------------------------------------------------- storage ---
@@ -366,7 +373,12 @@ bool hal::storageThere(uint16_t vid, uint16_t pid) {
 
 bool hal::storageCommand(const uint8_t* cdb, uint8_t cdbLen, bool in, uint8_t* buf, uint32_t len, uint32_t* got,
                          uint32_t) {
-  return fake::storage(cdb, cdbLen, in, buf, len, got);
+  // (on the board, the job waits for the USB transfer: the idle task runs. What the pretend FM-1 reads and writes of
+  // its own flash file meanwhile is not the SD card's)
+  watchdog::waited();
+  bool ok = fake::storage(cdb, cdbLen, in, buf, len, got);
+  watchdog::waited();
+  return ok;
 }
 
 // ------------------------------------------------------------------------------------ USB MIDI for a computer ---

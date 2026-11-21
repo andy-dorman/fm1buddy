@@ -29,6 +29,12 @@ bool storageThere(uint16_t vid, uint16_t pid);
 bool storage(const uint8_t* cdb, uint8_t cdbLen, bool in, uint8_t* buf, uint32_t len, uint32_t* got);
 // recovery: it took the key as it was switched on (whatever its firmware): straight into its boot loader
 void keyed();
+// its boot loader's flash is kept in the file path across runs (read from it if it is there, written after an install
+// and when the boot loader ends). Call it before begin. Off by default
+void keepFlash(const std::string& path);
+// another pretend FM-1: its flash chip's unique ID is its own (n: 1 and up; 0 is the first one's), and so are the flash
+// head and the key_mac sector of a flash that is made up. Call it before begin
+void uniqueId(int n);
 // the sha256 of its flash (its boot loader's, once it has been there: "" before)
 std::string flashSha();
 }  // namespace fake

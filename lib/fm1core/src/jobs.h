@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "catalog.h"
+#include "datasave.h"
 #include "hal.h"
 #include "sounds.h"
 
@@ -36,6 +37,7 @@ enum Kind { NONE,
             CHECK_UPDATE,   // fm1buddy's newest release, from the installer page (updateTag)
             FW_UPDATE,      // a firmware on the SD card replaced by its newer one from the Hub
             SYNC,           // /fm1 brought up to date with the Hub: what the sync plan says (syncplan.h)
+            DATA_RESTORE,   // a data save's data sectors back on the FM-1 (through its boot loader: datasave.h)
             UPDATE };       // fm1buddy's newest release onto this board (then it restarts)
 enum Step { IDLE,
             JOINING,
@@ -102,6 +104,14 @@ extern std::atomic<uint32_t> syncNew, syncUpdated, syncUnchanged, syncRemoved, s
 // once it has finished
 extern bool ok;
 extern std::string error;
+// INSTALL: the install failed because its data save failed (nothing was written to the FM-1: error says why), and the
+// unique ID of the flash chip that the data save read ("" if there was no data save)
+extern bool dataSaveFailed;
+extern std::string dataSaveUid;
+// DATA_RESTORE: why it stopped. Each one writes nothing, but sectorFailed
+extern bool anotherFm1;    // the data save is from another FM-1 (or has no unique ID)
+extern bool noPackage;     // no firmware in /fm1 is the firmware of the data save
+extern bool sectorFailed;  // a sector failed 3 times: the job stopped, and the flash may not start
 extern std::vector<hal::Ap> aps;  // SCAN
 extern FwList hub;                // HUB: the new list
 extern std::string hubUpdated;
@@ -119,7 +129,9 @@ bool bluetoothPaused();
 bool download(const Firmware& f);
 bool scan();
 bool join(const char* ssid, const char* pass);
-bool install(const Firmware& f);
+// dataSave: a data save of the whole flash goes to /backups/switch before the install (fails the job, with
+// dataSaveFailed, when it fails); false installs with none
+bool install(const Firmware& f, bool dataSave = true);
 // newer, from the Hub, into /fm1 in place of the file old (a .part until it's checked: old stays if it fails)
 bool updateFirmware(const Firmware& newer, const std::string& old);
 // /fm1 brought up to date with the Hub's list: what a sync does is in the sync plan, and what it wrote in the sync
@@ -134,6 +146,20 @@ bool keep(int d);
 bool restore(int d, const std::string& setup);  // in /setups
 bool exportSetup(const std::string& setup, const char* app);
 bool backup(int d);    // device d: the FM-1
+// the data sectors of a data save (file: a .bin in /backups/switch) back on device d, the FM-1 (alone on the hub). It
+// refuses, before it writes anything, what datasave::refusal says (error says why), and a data save that no firmware
+// of /fm1 matches. It first reads the unique ID and stops (anotherFm1) when the data save is from another FM-1.
+// dataSaveFirst: after every refusal and before the first write, a data save of the current data goes to
+// /backups/switch (its file name in saved; when it fails, nothing is written). When the restore ends with a good write
+// and read-back, old data saves are removed, and the data save of the restore stays
+// transfer: the data save may be from another FM-1. The job then skips that stop, always makes the data save first, and
+// installs the matching package of /fm1 first when the FM-1 runs another build (no data save of that install). The
+// flash head and the key_mac sector of the FM-1 stay as they are
+bool restoreData(int d, const std::string& file, bool dataSaveFirst = false, bool transfer = false);
+// the data saves in /backups/switch, newest first (the list of the "Backup & recover" page)
+std::vector<datasave::Save> dataSaveList();
+// the .bin file of the newest data save of the firmware product with this unique ID ("" if there is none)
+std::string dataSaveFor(const std::string& product, const std::string& uid);
 bool identify(int d);  // device d: the FM-1
 // recovery: what goes on the FM-1 (a .fwsc in /fm1, or a backup's .bin in /backups) is kept, and the board restarts
 // into recovery mode

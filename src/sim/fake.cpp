@@ -627,19 +627,21 @@ static void ubCipher(uint8_t* p, uint32_t n) {
   }
 }
 
-static void ubootEnter() {
-  hal::log("fake fm-1: into its boot loader");
-  midi::umount(FM1);
-  f.state = decltype(f.state)::GONE;
-  f.waiting = false;
-  f.mountAt = 0;
-  ub.on = true, ub.loaderRunning = false, ub.loaderGot = 0, ub.at = hal::millis();
+static int uniqueN;  // fake::uniqueId
+
+// its flash, made up the first time it is needed (or read from the file of fake::keepFlash)
+static void ubInit() {
   if (ub.flash.empty()) {
     ub.flash.resize(1024 * 1024);
     for (uint32_t i = 0; i < ub.flash.size(); i++) {
       ub.flash[i] = (uint8_t)((i * 2654435761u) >> 24);
     }
     memcpy(&ub.flash[0x93000], f.ident.c_str(), f.ident.size());  // (something to find)
+    for (uint32_t i = 0; i < ub.flash.size() && uniqueN; i++) {
+      if (i < 0x4000 || i >= 0xFF000) {  // (the flash head and the key_mac sector: its own)
+        ub.flash[i] ^= (uint8_t)(0x40 + uniqueN);
+      }
+    }
     if (f.smk) {
       memcpy(&ub.flash[0xC1224], "trimdat", 7);  // (the SMK-37's calibration: its own, uboot.h SMK_CAL)
     }
@@ -649,8 +651,73 @@ static void ubootEnter() {
   }
 }
 
+static void ubootEnter() {
+  hal::log("fake fm-1: into its boot loader");
+  midi::umount(FM1);
+  f.state = decltype(f.state)::GONE;
+  f.waiting = false;
+  f.mountAt = 0;
+  ub.on = true, ub.loaderRunning = false, ub.loaderGot = 0, ub.at = hal::millis();
+  ubInit();
+}
+
+// its flash kept in a file across runs: the flash, and beside it ".ident" with what the FM-1 says it is
+static std::string flashFile, keptIdent;
+
+static void ubSave() {
+  if (flashFile.empty() || ub.flash.empty()) {
+    return;
+  }
+  if (FILE* o = fopen(flashFile.c_str(), "wb")) {
+    fwrite(ub.flash.data(), 1, ub.flash.size(), o);
+    fclose(o);
+  }
+  if (FILE* o = fopen((flashFile + ".ident").c_str(), "w")) {
+    fputs(f.ident.c_str(), o);
+    fclose(o);
+  }
+}
+
+void fake::keepFlash(const std::string& path) {
+  flashFile = path;
+  std::vector<uint8_t> bytes(1024 * 1024);
+  if (FILE* i = fopen(path.c_str(), "rb")) {
+    if (fread(bytes.data(), 1, bytes.size(), i) == bytes.size()) {
+      ub.flash = bytes;
+    }
+    fclose(i);
+  }
+  if (FILE* i = fopen((path + ".ident").c_str(), "r")) {
+    char line[28] = "";
+    if (!ub.flash.empty() && fgets(line, sizeof line, i)) {
+      keptIdent = line;
+    }
+    fclose(i);
+  }
+}
+
+// a good install: the package's flash image is what its boot loader reads from now on (from 0: its data stays)
+static void installIntoFlash() {
+  Pkg pkg;
+  uint32_t at = 0, n = 0;
+  if (pkg.open(fm1::imagePath) || !pkg.flash(at, n) || n > 1024 * 1024) {
+    hal::log("fake fm-1: no flash image in the package");
+    return;
+  }
+  std::vector<uint8_t> image(n);
+  if (!pkg.read(at, image.data(), n)) {
+    return;
+  }
+  ubInit();
+  memcpy(ub.flash.data(), image.data(), n);
+}
+
 void fake::keyed() {
   ubootEnter();
+}
+
+void fake::uniqueId(int n) {
+  uniqueN = n;
 }
 
 std::string fake::flashSha() {
@@ -663,6 +730,7 @@ std::string fake::flashSha() {
 
 // out of it: its firmware starts again (it's already gone from the hub as a MIDI device)
 static void ubootLeave() {
+  ubSave();
   ub.on = false;
   f.state = decltype(f.state)::GONE;
   f.next = decltype(f.state)::RUN;
@@ -765,7 +833,8 @@ bool fake::storage(const uint8_t* cdb, uint8_t cdbLen, bool in, uint8_t* buf, ui
     return true;
   }
   if (cmd == 0xFC42) {  // the flash's unique ID
-    static const uint8_t UID[8] = {0x31, 0x4E, 0x0A, 0x9C, 0x52, 0x17, 0x28, 0xC3};
+    uint8_t UID[8] = {0x31, 0x4E, 0x0A, 0x9C, 0x52, 0x17, 0x28, 0xC3};
+    UID[7] = (uint8_t)(UID[7] + uniqueN);
     memcpy(buf + 2, UID, 8);
     return true;
   }
@@ -843,6 +912,11 @@ static void fromHost(const uint8_t* b, uint32_t n) {
       if (f.addr == 0xF0000000u) {
         bool good = flashGood();
         hal::log("fake fm-1: flash %s", good ? "matches the package" : "DOESN'T match the package");
+        if (good) {
+          installIntoFlash();
+          f.ident = fm1::imageProduct;
+          ubSave();
+        }
         restart(decltype(f.state)::RUN, good ? fm1::imageProduct : "FM-1_bad");
       } else if (f.faults && !f.unplugged && f.addr > size * 2 / 5) {
         f.unplugged = true;
@@ -1041,6 +1115,9 @@ static void run(bool fm1, int keys) {
   if (fm1) {
     f.ident = f.smk ? "SMK-37 Elite_016" : f.fomajam ? "FM-1_961"
                                                      : "FM-1_015";
+    if (!keptIdent.empty() && !f.smk) {
+      f.ident = keptIdent;
+    }
     f.next = decltype(f.state)::RUN;
     f.mountAt = hal::millis() + 500;
   }

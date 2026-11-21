@@ -812,6 +812,7 @@ bool hal::sha256(const char* path, char hex[65]) {
   }
   for (size_t n; (n = fread(buf, 1, 4096, f));) {
     mbedtls_sha256_update(&ctx, buf, n);
+    sdPace(n);
   }
   fclose(f);
   uint8_t sum[32];

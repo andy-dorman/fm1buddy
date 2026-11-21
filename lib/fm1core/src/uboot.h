@@ -21,6 +21,7 @@
 #include "catalog.h"
 
 #define BACKUPS_DIR "/backups"
+#define DATA_SAVES_DIR BACKUPS_DIR "/switch"  // the data saves made before each install
 
 namespace uboot {
 struct Chip {

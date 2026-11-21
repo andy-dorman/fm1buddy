@@ -53,7 +53,11 @@ bool FlashBuf::write(uint32_t at, const uint8_t* p, uint32_t len) {
     memcpy(mem + at, p, len);
     return true;
   }
-  return f && !fseek(f, at, SEEK_SET) && fwrite(p, 1, len, f) == len;
+  if (!f || fseek(f, at, SEEK_SET) || fwrite(p, 1, len, f) != len) {
+    return false;
+  }
+  sdPace(len);
+  return true;
 }
 
 bool FlashBuf::read(uint32_t at, uint8_t* p, uint32_t len) const {
@@ -64,14 +68,11 @@ bool FlashBuf::read(uint32_t at, uint8_t* p, uint32_t len) const {
     memcpy(p, mem + at, len);
     return true;
   }
-  return f && !fseek(f, at, SEEK_SET) && fread(p, 1, len, f) == len;
-}
-
-bool FlashBuf::sha256(char hex[65]) const {
-  if (mem) {
-    return hal::sha256(mem, n, hex);
+  if (!f || fseek(f, at, SEEK_SET) || fread(p, 1, len, f) != len) {
+    return false;
   }
-  return f && !fflush(f) && hal::sha256(file.c_str(), hex);
+  sdPace(len);
+  return true;
 }
 
 bool FlashBuf::saveTo(const char* path, void (*between)()) const {

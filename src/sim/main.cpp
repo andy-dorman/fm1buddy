@@ -1,7 +1,7 @@
 // The app on the desktop: an SDL window twice the screen's size, the mouse for touch.
 //
 //   program [--headless] [--zoom N] [--theme NAME] [--fm1] [--fomajam] [--sloop] [--kitten] [--smk] [--lostcal] [--bigscreen] [--faults] [--keys [N]] [--clock] [--install FILE]
-//           [--backup] [--recover FILE] [--lowmem]
+//           [--backup] [--recover FILE] [--restore FILE [--save-first] [--transfer]] [--uid N] [--lowmem] [--watchdog BYTES]
 //           [--script "tap 24 70; wait 300; shot a.bmp; quit"]
 //
 // --fm1 puts a pretend FM-1 on the hub (it goes through a whole install), --fomajam makes it one running fomajam (it
@@ -9,9 +9,12 @@
 // and sends MIDI clock at 100 BPM).
 // --install FILE installs /fm1/FILE on the pretend FM-1, again (as a person would) if it doesn't finish, up to 3
 // times, then quits: 0 if it's installed, 1 if not.
-// --backup backs up the pretend FM-1's flash, --recover FILE (/fm1/X.fwsc or /backups/X.bin) recovers it (recovery
-// mode, the key, the writes), then quit: 0 if it went, 1 if not. Each logs its flash's sha256 after ("sim: flash").
+// --backup backs up the pretend FM-1's flash, --restore FILE (a .bin in /backups/switch) puts a data save's data
+// sectors back on it (--save-first: a data save of the current data first; --transfer: the data save may be from another FM-1, and the matching package is installed first if the FM-1 runs another build; --uid N: the pretend FM-1 has another unique ID, flash head, and key_mac sector), --recover FILE (/fm1/X.fwsc or /backups/X.bin) recovers it (recovery mode, the key, the writes),
+// then quit: 0 if it went, 1 if not. Each logs its flash's sha256 after ("sim: flash").
 // --lowmem keeps big things on the SD card (memory.h lowMemory), as a board without PSRAM does (cardbuddy's)
+// --watchdog BYTES models the board's task watchdog: a job that reads and writes more than BYTES of the SD card with no
+// wait ends the program with exit code 3, as the board restarts (watchdog.cpp)
 //
 // The script runs after start: tap X Y (screen pixels), drag X1 Y1 X2 Y2, press X Y and release (a finger held),
 // finger2 X Y and lift2 (a second finger, for the touch controller), wait MS, shot FILE (a .bmp of the
@@ -43,6 +46,7 @@
 #include "themes.h"
 #include "ui.h"
 #include "ui_priv.h"
+#include "watchdog.h"
 
 #define W SCREEN_W
 #define H SCREEN_H
@@ -138,8 +142,8 @@ int main(int argc, char** argv) {
   int keys = 0;
   const char* themeName = 0;
   int zoom = 2;
-  std::string script, install, recoverFrom;
-  bool backup = false;
+  std::string script, install, recoverFrom, restoreFrom;
+  bool backup = false, saveFirst = false, transfer = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--headless")) {
       headless = true;
@@ -151,11 +155,24 @@ int main(int argc, char** argv) {
       faults = true;
     } else if (!strcmp(argv[i], "--backup")) {
       backup = fm1 = true;
+    } else if (!strcmp(argv[i], "--save-first")) {
+      saveFirst = true;
+    } else if (!strcmp(argv[i], "--transfer")) {
+      transfer = true;
+    } else if (!strcmp(argv[i], "--uid") && i + 1 < argc) {
+      fake::uniqueId(atoi(argv[++i]));
+    } else if (!strcmp(argv[i], "--restore") && i + 1 < argc) {
+      restoreFrom = argv[++i];
+      fm1 = true;
     } else if (!strcmp(argv[i], "--recover") && i + 1 < argc) {
       recoverFrom = argv[++i];
       fm1 = true;
+    } else if (!strcmp(argv[i], "--flash") && i + 1 < argc) {  // its flash kept in a file across runs
+      fake::keepFlash(argv[++i]);
     } else if (!strcmp(argv[i], "--lowmem")) {
       lowMemory = true;
+    } else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) {
+      watchdog::enable(strtoull(argv[++i], 0, 10));
     } else if (!strcmp(argv[i], "--install") && i + 1 < argc) {
       install = argv[++i];
       fm1 = true;
@@ -232,6 +249,7 @@ int main(int argc, char** argv) {
   int tries = 0, result = 0;
   bool ended = true;
   uint32_t installAt = hal::millis() + 3000;
+  bool dataSave = true;
 
   for (bool run = true; run;) {
     if (win) {
@@ -311,29 +329,37 @@ int main(int argc, char** argv) {
       installAt = hal::millis() + 3000;  // the next try a while after, as a person would
       if (jobs::ok) {
         hal::log("sim: installed");
+        hal::log("sim: flash %s", fake::flashSha().c_str());
         run = false;
+      } else if (jobs::dataSaveFailed) {  // the user answers y to "Install anyway?"
+        hal::log("sim: not saved: %s", jobs::error.c_str());
+        dataSave = false;
+        tries--;
       } else if (tries == 3) {
         hal::log("sim: not installed: %s", jobs::error.c_str());
         result = 1;
         run = false;
       }
     }
-    // --backup, --recover: a job at a time (0: not started), each once the last has finished
+    // --backup, --restore, --recover: a job at a time (0: not started), each once the last has finished
     static int phase;
     static uint32_t seen;
-    if (run && (backup || !recoverFrom.empty()) && (int32_t)(hal::millis() - installAt) >= 0 && !jobs::running) {
+    if (run && (backup || !restoreFrom.empty() || !recoverFrom.empty()) && (int32_t)(hal::millis() - installAt) >= 0 && !jobs::running) {
       bool over = phase && seen != jobs::finished;
       if (backup && !phase && fm1::current() >= 0) {
         hal::log("sim: backup");
         seen = jobs::finished, phase = jobs::backup(fm1::current()) ? 1 : 9;
+      } else if (!restoreFrom.empty() && !phase && fm1::current() >= 0) {
+        hal::log("sim: restore %s", restoreFrom.c_str());
+        seen = jobs::finished, phase = jobs::restoreData(fm1::current(), restoreFrom, saveFirst, transfer) ? 4 : 9;
       } else if (!recoverFrom.empty() && !phase && fm1::current() >= 0) {
         hal::log("sim: recover %s: prepare", recoverFrom.c_str());
         seen = jobs::finished, phase = jobs::prepare(recoverFrom) ? 2 : 9;
       } else if (phase == 2 && over && jobs::ok) {
         hal::log("sim: recover");
         seen = jobs::finished, phase = jobs::recover() ? 3 : 9;
-      } else if ((phase == 1 || phase == 3) && over) {
-        hal::log("sim: %s: %s%s", phase == 1 ? "backup" : "recover", jobs::ok ? "ok " : "failed: ",
+      } else if ((phase == 1 || phase == 3 || phase == 4) && over) {
+        hal::log("sim: %s: %s%s", phase == 1 ? "backup" : phase == 4 ? "restore" : "recover", jobs::ok ? "ok " : "failed: ",
                  jobs::ok ? jobs::saved.c_str() : jobs::error.c_str());
         hal::log("sim: flash %s", fake::flashSha().c_str());
         result = !jobs::ok;
@@ -355,7 +381,7 @@ int main(int argc, char** argv) {
       f.onSd = true;
       tries++;
       hal::log("sim: install, try %d", tries);
-      ended = !jobs::install(f);
+      ended = !jobs::install(f, dataSave);
     }
     lv_timer_handler();
     if (win && dirty) {

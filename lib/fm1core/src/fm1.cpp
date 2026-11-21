@@ -278,6 +278,7 @@ bool Pkg::fileRead(uint32_t off, uint8_t* out, uint32_t len) const {
     if (off < cacheAt || off >= cacheAt + cacheLen) {
       cacheAt = off & ~511u;
       cacheLen = fseek(file, cacheAt, SEEK_SET) ? 0 : fread(cache, 1, 4096, file);
+      sdPace(cacheLen);
       if (off >= cacheAt + cacheLen) {
         cacheLen = 0;
         return false;

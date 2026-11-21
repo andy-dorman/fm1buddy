@@ -15,6 +15,7 @@
 #include <chrono>
 #include <thread>
 
+#include "datasave.h"
 #include "flashbuf.h"
 #include "fm1.h"
 #include "memory.h"
@@ -35,6 +36,11 @@ std::atomic<bool> mapChecking{false};
 std::atomic<uint32_t> mapSeq{0};
 bool ok;
 std::string error;
+bool dataSaveFailed;
+std::string dataSaveUid;
+bool anotherFm1;
+bool noPackage;
+bool sectorFailed;
 std::vector<hal::Ap> aps;
 FwList hub;
 std::string hubUpdated;
@@ -58,7 +64,7 @@ static void progress(uint32_t d, uint32_t t) {
 
 static const char* NAMES[] = {"none", "hub", "download", "scan", "join", "install", "probe", "send", "voice", "keep",
                               "restore", "export", "backup", "prepare", "recover", "sloop backup", "sloop restore",
-                              "sloop project", "sloop song", "sloop song in", "sloop samples", "identify", "check update", "firmware update", "sync", "update"};
+                              "sloop project", "sloop song", "sloop song in", "sloop samples", "identify", "check update", "firmware update", "sync", "data restore", "update"};
 static_assert(sizeof NAMES / sizeof *NAMES == UPDATE + 1, "a name for each job");
 
 // a conversation in SysEx with the FM-1: routing stops meanwhile (its replies aren't for the other devices, and a
@@ -867,6 +873,10 @@ static FILE* newRecord(std::string& name) {
   return f;
 }
 
+static bool installDataSave = true;  // INSTALL: a data save first
+static bool dataSaveBefore();        // (with the backup)
+static void dataSaveReset();
+
 static void installJob(void*) {
   if (!target.onSd) {
     target.file = freeName(target.file);
@@ -883,6 +893,9 @@ static void installJob(void*) {
   }
   if (!target.sha256.empty() && strcasecmp(pkg.sha256, target.sha256.c_str())) {
     error = "The file on the SD card isn't what the Hub says it is (sha256): download it again.";
+    return finish(false);
+  }
+  if (installDataSave && !dataSaveBefore()) {
     return finish(false);
   }
   std::string name;
@@ -969,11 +982,13 @@ bool jobs::sync() {
   return start(SYNC, syncJob);
 }
 
-bool jobs::install(const Firmware& f) {
+bool jobs::install(const Firmware& f, bool dataSave) {
   if (running) {
     return false;
   }
   target = f;
+  installDataSave = dataSave;
+  dataSaveReset();
   return start(INSTALL, installJob);
 }
 
@@ -1236,12 +1251,61 @@ static void mapSmk(const FlashBuf& flash) {
   }
 }
 
-// a flash as backups/fm1-N-FW.bin (its name into saved), and what it was (fm1-N-FW.txt). FW: the firmware it ran
-// ("FM-1_904"), when that's known. N comes first (the lists sort by it). With alive: the loader is still running, and
+// the FM-1 out of its boot loader, back to its firmware. e (an error of the job, or 0): the USB starts again, and error
+// says it (and, if the FM-1 stayed in its boot loader, that it must be switched off and on)
+static void leaveLoader(const char* e) {
+  step = LEAVING;
+  uboot::leave();
+  for (uint32_t start = hal::millis(); uboot::stuck() && hal::millis() - start < 3000;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  hal::bleHold(false);
+  if (e) {
+    bool stuck = uboot::stuck();
+    hal::usbRestart();  // (whatever the boot loader left behind: the FM-1 is found again)
+    error = std::string(e) + (stuck ? " Switch the FM-1 off and on to get it back." : "");
+  }
+}
+
+// the whole flash of device d into a (read twice, and the same): through its boot loader, and the FM-1 goes back to its
+// firmware. title is on the FM-1's own screen, what names the FlashBuf, smkScreen says whose screen it is. False: error
+// says why
+static bool readFlash(int d, bool smkScreen, const char* title, const char* what, uboot::Chip& chip, FlashBuf& a) {
+  step = BOOT_LOADER;
+  hal::bleHold(true);
+  const char* e = uboot::enter(d, chip);
+  if (!e && !a.make(chip.size, what)) {
+    e = "No room to read it into (memory, or the SD card).";
+  }
+  if (!e) {
+    fmStart(smkScreen, title);
+    step = READING_FLASH;
+    reading = 1;
+    fmReading("READING", 0, 50);
+    e = mapRead(chip, &a, 0);
+    mapSmk(a);
+  }
+  if (!e) {
+    reading = 2;
+    fmReading("READING IT AGAIN", 50, 50);
+    mapAgainst = &a;
+    e = mapRead(chip, 0, againstKept);
+  }
+  fmShow(e ? "FAILED" : "DONE", e ? -1 : 100, true);
+  fmOn = false;
+  leaveLoader(e);
+  return !e;
+}
+
+// a flash as dir/fm1-N-FW.bin (its name into saved), and what it was (fm1-N-FW.txt). FW: the firmware it ran
+// ("FM-1_904"), when that's known. N comes first (the lists sort by it). head: the first line of the .txt ("" says it's
+// a backup). last: the file of the install before, when there is one. With alive: the loader is still running, and
 // kept so (the card can take longer than it waits)
 static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::string& was, bool alive,
-                       const std::string& fw = "") {
-  std::string dir = catalog::path(BACKUPS_DIR);
+                       const std::string& fw = "", const char* folder = BACKUPS_DIR, const std::string& head = "",
+                       const std::string& last = "") {
+  mkdir(catalog::path(BACKUPS_DIR).c_str(), 0777);
+  std::string dir = catalog::path(folder);
   mkdir(dir.c_str(), 0777);
   bool smk = smkIn(a);
   const char* prefix = smk ? "smk-" : "fm1-";  // (an SMK-37's has its calibration: uboot.h)
@@ -1263,7 +1327,6 @@ static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::st
   std::string base = dir + "/" + stem;
   saved = stem + ".bin";
   char sha[65] = "";
-  a.sha256(sha);
   if (alive) {
     uboot::keepAlive();
   }
@@ -1271,14 +1334,22 @@ static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::st
   if (alive) {
     uboot::keepAlive();
   }
+  // the hash of the bytes that are in the saved file, read after saveTo closed it. (Not of the FlashBuf: its temporary
+  // file on the SD card is still open, and FATFS shows its size to a second open only after a close. That gave the hash
+  // of nothing.) A hash that fails is a save that failed.
+  ok = ok && hal::sha256((dir + "/" + saved).c_str(), sha);
   if (ok) {
     FILE* f = fopen((base + ".txt").c_str(), "w");
     const char* part = uboot::flashName(chip.flashId);
-    ok = f && fprintf(f,
-                      "fm1buddy backup: all of the %s's flash, through its boot loader\n"
-                      "firmware %s\nchip key %04X\nflash    %06X, %u bytes%s%s\nflash id %s\nsha256   %s\n",
-                      smk ? "SMK-37" : "FM-1", was.empty() ? "?" : was.c_str(), chip.key, (unsigned)chip.flashId,
+    std::string first = head.empty() ? std::string("fm1buddy backup: all of the ") + (smk ? "SMK-37" : "FM-1") +
+                                           "'s flash, through its boot loader"
+                                     : head;
+    ok = f && fprintf(f, "%s\nfirmware %s\nchip key %04X\nflash    %06X, %u bytes%s%s\nflash id %s\nsha256   %s\n",
+                      first.c_str(), was.empty() ? "?" : was.c_str(), chip.key, (unsigned)chip.flashId,
                       (unsigned)chip.size, part ? ", " : "", part ? part : "", uboot::uidText(chip).c_str(), sha) > 0;
+    if (ok && !last.empty()) {
+      ok = fprintf(f, "install  %s\n", last.c_str()) > 0;
+    }
     ok &= f && !fclose(f);
   }
   if (!ok) {
@@ -1295,40 +1366,9 @@ static void backupJob(void*) {
   mkdirs();
   const Fm1Id* id = fm1::known(device);
   std::string was = id ? id->text : "";
-  step = BOOT_LOADER;
-  hal::bleHold(true);
   uboot::Chip chip;
-  const char* e = uboot::enter(device, chip);
   FlashBuf a;
-  if (!e && !a.make(chip.size, "backup")) {
-    e = "No room to read it into (memory, or the SD card).";
-  }
-  if (!e) {
-    fmStart(id && isSmk(id->model), "BACKUP");
-    step = READING_FLASH;
-    reading = 1;
-    fmReading("READING", 0, 50);
-    e = mapRead(chip, &a, 0);
-    mapSmk(a);
-  }
-  if (!e) {
-    reading = 2;
-    fmReading("READING IT AGAIN", 50, 50);
-    mapAgainst = &a;
-    e = mapRead(chip, 0, againstKept);
-  }
-  fmShow(e ? "FAILED" : "DONE", e ? -1 : 100, true);
-  fmOn = false;
-  step = LEAVING;
-  uboot::leave();
-  for (uint32_t start = hal::millis(); uboot::stuck() && hal::millis() - start < 3000;) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  hal::bleHold(false);
-  if (e) {
-    bool stuck = uboot::stuck();
-    hal::usbRestart();  // (whatever the boot loader left behind: the FM-1 is found again)
-    error = std::string(e) + (stuck ? " Switch the FM-1 off and on to get it back." : "");
+  if (!readFlash(device, id && isSmk(id->model), "BACKUP", "backup", chip, a)) {
     return finish(false);
   }
   finish(saveBackup(a, chip, was, false, was));
@@ -1379,6 +1419,142 @@ bool jobs::backup(int d) {
   reading = 0;
   mapClear();
   return start(BACKUP, backupJob);
+}
+
+// ------------------------------------------------------------------------------------ the data save ---
+static void dataSaveReset() {
+  dataSaveFailed = false;
+  dataSaveUid.clear();
+  reading = 0;
+  mapClear();
+}
+
+// the package file of the newest install record ("" if there is none)
+static std::string lastInstall() {
+  std::string dir = catalog::path(INSTALLS_DIR);
+  int last = 0;
+  if (DIR* d = opendir(dir.c_str())) {
+    while (dirent* e = readdir(d)) {
+      last = std::max(last, atoi(e->d_name));
+    }
+    closedir(d);
+  }
+  std::string name;
+  if (FILE* f = last ? fopen((dir + "/" + std::to_string(last) + ".txt").c_str(), "r") : 0) {
+    char line[200];
+    while (fgets(line, sizeof line, f)) {
+      if (!strncmp(line, "file     ", 9)) {
+        name = line + 9;
+        while (!name.empty() && (name.back() == '\n' || name.back() == '\r')) {
+          name.pop_back();
+        }
+        break;
+      }
+    }
+    fclose(f);
+  }
+  return name;
+}
+
+// the .txt file of a data save: what it says of the data save (false if there is none)
+static bool readSave(const std::string& bin, datasave::Save& save) {
+  std::string text = catalog::path(DATA_SAVES_DIR) + "/" + bin.substr(0, bin.size() - 4) + ".txt";
+  FILE* f = fopen(text.c_str(), "r");
+  if (!f) {
+    return false;
+  }
+  std::string all;
+  char chunk[200];
+  for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) {
+    all.append(chunk, n);
+  }
+  fclose(f);
+  save = datasave::fromText(bin, all);
+  return true;
+}
+
+// the data saves on the SD card: each .bin file that has its .txt file
+static std::vector<datasave::Save> dataSaves() {
+  std::vector<datasave::Save> out;
+  std::string dir = catalog::path(DATA_SAVES_DIR);
+  DIR* d = opendir(dir.c_str());
+  while (d) {
+    dirent* e = readdir(d);
+    if (!e) {
+      break;
+    }
+    size_t n = strlen(e->d_name);
+    if (n <= 4 || strcasecmp(e->d_name + n - 4, ".bin")) {
+      continue;
+    }
+    datasave::Save save;
+    if (!readSave(e->d_name, save)) {
+      continue;
+    }
+    out.push_back(save);
+  }
+  if (d) {
+    closedir(d);
+  }
+  return out;
+}
+
+// the data saves that the remove decision gives, off the SD card (keep: the .bin file that stays)
+static void removeOldDataSaves(const std::string& keep) {
+  for (const std::string& name : datasave::toRemove(dataSaves(), keep)) {
+    remove((catalog::path(DATA_SAVES_DIR) + "/" + name).c_str());
+  }
+}
+
+// INSTALL, before the install: the FM-1's whole flash to /backups/switch, and the older ones off. False: nothing was
+// written to the FM-1, error says why, and dataSaveFailed says it was the data save. An SMK-37 gets none. An FM-1 with
+// no identity, or in its update loader, is a data save failure: the user answers "Install anyway?"
+static bool dataSaveBefore() {
+  int d = fm1::current();
+  const Fm1Id* known = fm1::known(d);
+  if (known && !known->ota() && isSmk(known->model)) {
+    return true;  // an SMK-37 has no data to save
+  }
+  if (!known || known->ota()) {
+    dataSaveFailed = true;
+    error = known ? "The FM-1 is in its update loader: the data save needs its firmware."
+                  : "The FM-1 gave no firmware identity: the data save needs it.";
+    return false;
+  }
+  Fm1Id id = *known;  // (known is lost when the FM-1 leaves its firmware)
+  dataSaveFailed = true;
+  if (!hal::sd()) {
+    error = "No SD card: the data save goes on it.";
+    return false;
+  }
+  mkdirs();
+  uboot::Chip chip;
+  FlashBuf a;
+  if (!readFlash(d, false, "DATA SAVE", "data save", chip, a)) {
+    return false;
+  }
+  if (!smkIn(a)) {  // (an SMK-37 under the name of an FM-1: the calibration is its own)
+    step = SAVING;
+    std::string kept = saved;
+    std::string head = "fm1buddy data save: all of the FM-1's flash, before an install, through its boot loader";
+    bool good = saveBackup(a, chip, id.text, false, id.text, DATA_SAVES_DIR, head, lastInstall());
+    std::string own = saved;
+    saved = kept;
+    if (!good) {
+      return false;
+    }
+    dataSaveUid = uboot::uidText(chip);
+    removeOldDataSaves("");
+    hal::log("jobs: data save %s", own.c_str());
+  }
+  dataSaveFailed = false;
+  // the FM-1 starts its firmware again: the install looks for it one time only
+  step = ASKING;
+  done = 0;
+  for (uint32_t start = hal::millis(); fm1::current() < 0 && hal::millis() - start < 60000;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------------------- recovery ---
@@ -1681,6 +1857,323 @@ bool jobs::recover() {
   return start(RECOVER, recoverJob);
 }
 
+// ------------------------------------------------------------------------------- the data restore ---
+static FILE* restoreBin;             // DATA_RESTORE: the .bin file of the data save
+static const FlashBuf* restoreNow;   // the flash as it was read
+static uint32_t restoreFrom;         // the first sector that it writes
+
+static bool binRead(uint32_t at, uint8_t* out, uint32_t n) {
+  if (!restoreBin || fseek(restoreBin, at, SEEK_SET) || fread(out, 1, n, restoreBin) != n) {
+    return false;
+  }
+  sdPace(n);
+  return true;
+}
+
+// the sector at a once the data is back: what the data save holds from restoreFrom to key_mac, what is on it now
+// everywhere else
+static bool restoreExpect(uint32_t a, uint8_t* out) {
+  return a >= restoreFrom && a < WRITE_TO ? binRead(a, out, SECTOR) : restoreNow->read(a, out, SECTOR);
+}
+
+static std::string restoreFile;  // DATA_RESTORE: the data save's .bin file name, in DATA_SAVES_DIR
+static bool restoreSaveFirst;    // DATA_RESTORE: a data save of the current data comes before the first write
+static bool restoreTransfer;     // DATA_RESTORE: the data save may be from another FM-1 (a transfer)
+
+// the firmware of /fm1 whose flash image is the firmware of the data save: its image end (0: none). With flash (a
+// transfer), the data save and the flash decide the path, and file gets the name of the package in /fm1
+static uint32_t matchingImageEnd(const datasave::Reader* flash = 0, datasave::TransferPath* path = 0,
+                                 std::string* file = 0) {
+  for (size_t i = 0; i < catalog::sd.size(); i++) {
+    if (strncmp(catalog::sd.str(catalog::sd[i].product), "FM-1_", 5)) {
+      continue;
+    }
+    Pkg pkg;  // (one at a time: a board with no PSRAM has no room for two)
+    uint32_t at = 0, n = 0;
+    if (pkg.open(catalog::path(std::string(FW_DIR "/") + catalog::sd.str(catalog::sd[i].file)).c_str()) ||
+        !pkg.flash(at, n)) {
+      continue;
+    }
+    datasave::Package one{[&pkg, at](uint32_t a, uint8_t* out, uint32_t len) { return pkg.read(at + a, out, len); }, n};
+    if (flash) {
+      datasave::Transfer t = datasave::transfer(binRead, *flash, {one});
+      if (t.path == datasave::TRANSFER_NO_PACKAGE) {
+        continue;
+      }
+      *path = t.path;
+      *file = catalog::sd.str(catalog::sd[i].file);
+      return n;
+    }
+    if (datasave::matchPackage(binRead, {one}) == 0) {
+      return n;
+    }
+  }
+  return 0;
+}
+
+// A transfer to an FM-1 that runs another build: out of the boot loader, the package installed (no data save: the
+// transfer made it before), the FM-1 found again, its boot loader entered again, and its flash read again into now.
+// The job thread cannot call jobs::install: start refuses a job while one runs. loader says whether the boot loader
+// is open when this returns
+static const char* transferInstall(const std::string& file, uboot::Chip& chip, FlashBuf& now, bool& loader) {
+  fmOn = false;
+  leaveLoader(0);
+  loader = false;
+  // the FM-1 starts its firmware again: the install looks for it one time only
+  for (uint32_t start = hal::millis(); fm1::current() < 0 && hal::millis() - start < 60000;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  Pkg pkg;
+  if (const char* e = pkg.open(catalog::path(std::string(FW_DIR "/") + file).c_str())) {
+    return e;
+  }
+  uint32_t at = 0, n = 0;
+  total = pkg.flash(at, n) ? n : pkg.size;
+  done = 0;
+  step = ASKING;
+  hal::bleHold(true);
+  const char* e = fm1::install(pkg, installProgress, 0);
+  hal::bleHold(false);
+  if (e) {
+    return e;
+  }
+  for (uint32_t start = hal::millis(); fm1::current() < 0 && hal::millis() - start < 60000;) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+  if (fm1::current() < 0) {
+    return "The FM-1 didn't come back after the install: switch it off and on.";
+  }
+  step = BOOT_LOADER;
+  hal::bleHold(true);
+  loader = true;
+  if ((e = uboot::enter(fm1::current(), chip))) {
+    return e;
+  }
+  fmStart(false, "DATA RESTORE");
+  step = READING_FLASH;
+  reading = 1;
+  fmReading("READING", 0, 30);
+  e = mapRead(chip, &now, 0);
+  mapSmk(now);
+  return e;
+}
+
+static void restoreDataJob(void*) {
+  if (!hal::sd()) {
+    error = "No SD card.";
+    return finish(false);
+  }
+  step = GETTING_READY;
+  std::string path = catalog::path(DATA_SAVES_DIR) + "/" + restoreFile;
+  datasave::Restore r = {0, "", "", 0, 0, 0, 0};
+  datasave::Save save;
+  struct stat st;
+  char sha[65] = "";
+  restoreBin = fopen(path.c_str(), "rb");
+  if (!restoreBin || stat(path.c_str(), &st) || !readSave(restoreFile, save)) {
+    if (restoreBin) {
+      fclose(restoreBin);
+      restoreBin = 0;
+    }
+    error = "Can't read that data save on the SD card: nothing was written.";
+    return finish(false);
+  }
+  r.fileSize = st.st_size;
+  r.savedSha256 = save.sha256;
+  if (r.fileSize == 1024 * 1024 && hal::sha256(path.c_str(), sha)) {
+    r.fileSha256 = sha;
+  }
+  FlashBuf now;
+  const char* e = 0;
+  uboot::Chip chip;
+  const Fm1Id* known = fm1::known(device);
+  const std::string current = known ? known->text : "";  // (known is lost when the FM-1 leaves its firmware)
+  step = BOOT_LOADER;
+  hal::bleHold(true);
+  e = uboot::enter(device, chip);
+  std::vector<uint32_t> sectors;
+  bool refused = false;
+  bool inLoader = true;  // (a transfer that installs leaves it, and may fail outside it)
+  // the unique ID comes first: another FM-1 gets no data save and no write, unless the user asked for a transfer
+  if (!e && !restoreTransfer && !datasave::sameFm1(save, uboot::uidText(chip))) {
+    anotherFm1 = true;
+    e = "That data save is from another FM-1: nothing was written.";
+    refused = true;
+  }
+  if (!e) {
+    r.chipKey = chip.key;
+    r.flashId = chip.flashId;
+    r.flashSize = chip.size;
+    if (chip.key != FM1_KEY || chip.size != 1024 * 1024) {  // (nothing to read: the refusal says it)
+      e = datasave::reason(datasave::refusal(r, binRead, [](uint32_t, uint8_t*, uint32_t) { return false; }));
+      refused = true;
+    } else if (!now.make(chip.size, "now")) {
+      e = "No room to read it into (memory, or the SD card): nothing was written.";
+    }
+  }
+  datasave::Reader flash = [&now](uint32_t at, uint8_t* out, uint32_t n) { return now.read(at, out, n); };
+  if (!e) {
+    fmStart(false, "DATA RESTORE");
+    step = READING_FLASH;
+    reading = 1;
+    fmReading("READING", 0, 30);
+    e = mapRead(chip, &now, 0);
+    mapSmk(now);
+  }
+  // every refusal comes before the first write
+  datasave::TransferPath route = datasave::TRANSFER_WRITE;
+  std::string package;  // a transfer: the file in /fm1 that gets installed
+  uint32_t imageEnd = 0;  // the image end of the matching package (0: none)
+  if (!e) {
+    if (r.fileSize == 1024 * 1024) {
+      imageEnd = restoreTransfer ? matchingImageEnd(&flash, &route, &package) : matchingImageEnd();
+    }
+    // a flash that runs another build gets the firmware compare after the install, not before
+    r.imageEnd = route == datasave::TRANSFER_INSTALL ? 0 : imageEnd;
+    datasave::Refusal why = datasave::refusal(r, binRead, flash);
+    if (why != datasave::REFUSE_NONE) {
+      e = datasave::reason(why);
+      refused = true;
+    } else if (!imageEnd) {
+      noPackage = true;
+      e = "No firmware in /fm1 is the firmware of that data save: nothing was written.";
+      refused = true;
+    }
+  }
+  restoreNow = &now;
+  restoreFrom = imageEnd - imageEnd % SECTOR;
+  if (!e && route == datasave::TRANSFER_WRITE) {
+    bool lost = false;
+    sectors = datasave::sectors(binRead, flash, imageEnd, &lost);
+    if (lost) {
+      e = "Can't read it back from the SD card: nothing was written.";
+      refused = true;
+    }
+  }
+  // the refusals are over: the data save of the current data comes from the same read, before the first write
+  if (!e && restoreSaveFirst) {
+    step = SAVING;
+    fmShow("SAVING", 30, true);
+    std::string head = std::string("fm1buddy data save: all of the FM-1's flash, before a ") +
+                       (restoreTransfer ? "transfer" : "restore") + ", through its boot loader";
+    if (!saveBackup(now, chip, current, true, current, DATA_SAVES_DIR, head, lastInstall())) {
+      e = "Can't make a data save of the current data: nothing was written.";
+      refused = true;
+    }
+  }
+  if (!e && route == datasave::TRANSFER_INSTALL) {
+    e = transferInstall(package, chip, now, inLoader);
+    if (!e) {
+      r.chipKey = chip.key;
+      r.flashId = chip.flashId;
+      r.flashSize = chip.size;
+      r.imageEnd = imageEnd;
+      datasave::Refusal why = datasave::refusal(r, binRead, flash);
+      bool lost = false;
+      if (why != datasave::REFUSE_NONE) {
+        e = datasave::reason(why);
+      } else {
+        sectors = datasave::sectors(binRead, flash, imageEnd, &lost);
+        e = lost ? "Can't read it back from the SD card: nothing was written." : 0;
+      }
+    }
+    refused = e != 0;  // (a failure up to here leaves the data as the install left it: no write)
+  }
+  if (!e) {
+    hal::log("data restore: %s, %u sectors differ", restoreFile.c_str(), (unsigned)sectors.size());
+    for (uint32_t a : sectors) {
+      mapMark[a / SECTOR] = MARK_DIFFERS;
+    }
+    mapSeq++;
+    step = WRITING_FLASH;
+    total = sectors.size();
+    done = 0;
+    std::vector<uint8_t> data(SECTOR);
+    for (uint32_t a : sectors) {
+      mapAt = a / SECTOR;
+      mapSeq++;
+      char what[24];
+      snprintf(what, sizeof what, "WRITING %u/%u", (unsigned)done + 1, (unsigned)sectors.size());
+      fmShow(what, 30 + (int)(40 * done / sectors.size()), true);
+      if (!binRead(a, data.data(), SECTOR)) {
+        e = "Can't read it back from the SD card.";
+        break;
+      }
+      for (int t = 0; t < 3; t++) {
+        e = uboot::writeSector(a, data.data());
+        if (!e) {
+          break;
+        }
+        hal::log("data restore: sector %06X: %s", (unsigned)a, e);
+      }
+      if (e) {
+        sectorFailed = true;
+        break;
+      }
+      mapMark[a / SECTOR] = MARK_WRITTEN;
+      mapKind[a / SECTOR] = kindOf(data.data(), a / SECTOR);
+      mapAt = -1;
+      mapSeq++;
+      done = done + 1;
+    }
+  }
+  if (!e) {
+    step = CHECKING_FLASH;
+    reading = 2;
+    fmReading("CHECKING", 70, 30);
+    e = mapRead(chip, 0, restoreExpect);
+    if (e && mapBad) {
+      e = "It reads back differently from what was written.";
+    }
+  }
+  fmShow(e ? "FAILED" : "DONE", e ? -1 : 100, true);
+  fmOn = false;
+  if (inLoader) {
+    leaveLoader(e);
+  } else {  // (the install failed: the FM-1 is not in its boot loader)
+    hal::bleHold(false);
+    if (e) {
+      hal::usbRestart();
+      error = e;
+    }
+  }
+  restoreNow = 0;
+  fclose(restoreBin);
+  restoreBin = 0;
+  if (e) {
+    error += refused || sectors.empty() ? "" : " It may not start now: switch it off, and try again.";
+    return finish(false);
+  }
+  if (restoreSaveFirst) {  // (a restore with no data save of its own removes none)
+    removeOldDataSaves(restoreFile);
+  }
+  error = sectors.empty() ? "It already had that data." : "";
+  finish(true);
+}
+
+bool jobs::restoreData(int d, const std::string& file, bool dataSaveFirst, bool transfer) {
+  if (running) {
+    return false;
+  }
+  device = d;
+  restoreFile = file;
+  restoreTransfer = transfer;
+  restoreSaveFirst = dataSaveFirst || transfer;  // (a transfer always makes a data save of the target first)
+  anotherFm1 = noPackage = sectorFailed = false;
+  saved.clear();
+  reading = 0;
+  mapClear();
+  return start(DATA_RESTORE, restoreDataJob);
+}
+
+std::vector<datasave::Save> jobs::dataSaveList() {
+  return datasave::newestFirst(dataSaves());
+}
+
+std::string jobs::dataSaveFor(const std::string& product, const std::string& uid) {
+  return datasave::matchSave(dataSaves(), product, uid);
+}
+
 static std::string exportApp;
 
 static void exportJob(void*) {
@@ -1899,14 +2392,14 @@ std::string jobs::status() {
     case WRITING_FILES:
       return "Writing the files...";
     case BOOT_LOADER:
-      return "Into its boot loader...";
+      return kind == INSTALL ? "Saving its data: into its boot loader..." : "Into its boot loader...";
     case READING_FLASH: {
       uint32_t t = total, d = done;
-      return std::string(reading == 1 ? "Reading it " : "Reading it again ") +
+      return std::string(kind == INSTALL ? "Saving its data: " : "") + (reading == 1 ? "Reading it " : "Reading it again ") +
              std::to_string(t ? (unsigned long long)d * 100 / t : 0) + "%...";
     }
     case LEAVING:
-      return "Back to its firmware...";
+      return kind == INSTALL ? "Saving its data: back to its firmware..." : "Back to its firmware...";
     case GETTING_READY:
       return "Getting it ready...";
     case KEYING:
@@ -1920,7 +2413,7 @@ std::string jobs::status() {
       }
       return "Now plug the FM-1 back in, and switch it on.";
     case SAVING:
-      return "Saving its flash as it was...";
+      return kind == INSTALL ? "Saving its data to the SD card..." : "Saving its flash as it was...";
     case WRITING_FLASH: {
       uint32_t t = total, d = done;
       return "Writing " + std::to_string(t ? (unsigned long long)d * 100 / t : 0) + "%: keep it plugged in and on";
