@@ -12,6 +12,7 @@
 #include "fm1.h"
 #include "hal.h"
 #include "jobs.h"
+#include "savename.h"
 #include "uboot.h"
 #include "ui_priv.h"
 
@@ -153,6 +154,7 @@ void ui::recoverPage(lv_obj_t* page) {
 // --------------------------------------------------------------------------------- from Sounds ---
 struct Choice {
   std::string path, name, what;
+  long number = 0;  // the save number of a backup (0: it has none)
 };
 static std::vector<Choice> choices;
 static std::string chosen;
@@ -167,7 +169,7 @@ static void backups(std::vector<Choice>& out) {
       if (n <= 4 || strcasecmp(e->d_name + n - 4, ".bin")) {
         continue;
       }
-      Choice c{BACKUPS_DIR "/" + std::string(e->d_name), e->d_name, "backup"};
+      Choice c{BACKUPS_DIR "/" + std::string(e->d_name), e->d_name, "backup", savename::numberOfSaved(dir, e->d_name)};
       std::string txt = dir + "/" + std::string(e->d_name, n - 4) + ".txt";
       if (FILE* f = fopen(txt.c_str(), "r")) {
         char line[96];
@@ -184,8 +186,7 @@ static void backups(std::vector<Choice>& out) {
     closedir(d);
   }
   std::sort(found.begin(), found.end(), [](const Choice& a, const Choice& b) {
-    long x = atol(a.name.c_str() + 4), y = atol(b.name.c_str() + 4);
-    return x != y ? x > y : a.name > b.name;
+    return savename::newer(savename::Numbered{a.name, a.number}, savename::Numbered{b.name, b.number});
   });
   out.insert(out.end(), found.begin(), found.end());
 }

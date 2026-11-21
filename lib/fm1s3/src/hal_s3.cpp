@@ -506,6 +506,9 @@ bool hal::wifiJoin(const char* ssid, const char* pass, std::string& err) {
     wl_status_t s = WiFi.status();
     if (s == WL_CONNECTED) {
       wifiUp = true;
+      // the clock, in UTC, from the network: the request starts here and the join does not wait for the answer. A save
+      // before the answer has no date in its name. A power-off loses the date, and a software restart can keep it
+      configTime(0, 0, "pool.ntp.org");
       return true;
     }
     if (s == WL_CONNECT_FAILED || s == WL_NO_SSID_AVAIL) {

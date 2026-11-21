@@ -28,6 +28,15 @@ fail() {
   echo "$*" >&2
   exit 1
 }
+# the data saves of /backups/switch from the newest to the oldest, by the number line of the .txt file (an old data
+# save has none: the N of its name), as "number name" lines
+by_number() {
+  for f in "$work"/sd/backups/switch/*.bin; do
+    n=$(sed -n 's/^number //p' "${f%.bin}.txt")
+    [ -n "$n" ] || n=$(basename "$f" | sed -n 's/^fm1-\([0-9]*\).*/\1/p')
+    echo "${n:-0} $(basename "$f")"
+  done | sort -rn
+}
 # one run on the card in $work/sd: prints the flash's sha256 when it ends
 run() {
   FM1_SD="$work/sd" .pio/build/sim/program --headless --flash "$work/flash.bin" "$@" > "$work/log" 2>&1 || {
@@ -57,7 +66,7 @@ for how in "" "--lowmem"; do
   # a switch back: the install of the same package again makes a data save of the flash as the firmware left it
   again=$(run $how --install "$pkg")
   [ "$again" = "$after" ] || fail "${how:-(no flags)}: the install of the same package changed the flash"
-  second=$(ls "$work/sd/backups/switch" | grep '\.bin$' | sort -t- -k2 -n | tail -1)
+  second=$(by_number | head -1 | cut -d' ' -f2)
   [ "$second" != "$bin" ] || fail "${how:-(no flags)}: no second data save"
   [ "$(shasum -a 256 "$work/sd/backups/switch/$second" | cut -c1-64)" = "$after" ] || fail "${how:-(no flags)}: the second data save differs from the flash"
   # the firmware that ran meanwhile changed the data sectors, the flash head, and the key_mac sector
@@ -120,7 +129,7 @@ PY
   first=$(run $how --watchdog $((1024 * 1024)) --restore "$second" --save-first)
   [ "$first" = "$restored" ] || fail "${how:-(no flags)}: after the restore with a data save first the data sectors differ from the picked data save"
   [ "$(ls "$work/sd/backups/switch" | grep -c '\.bin$')" = 3 ] || fail "${how:-(no flags)}: the restore with a data save first made no new data save"
-  newest=$(ls "$work/sd/backups/switch" | grep '\.bin$' | sort -t- -k2 -n | tail -1)
+  newest=$(by_number | head -1 | cut -d' ' -f2)
   [ "$newest" != "$second" ] || fail "${how:-(no flags)}: no new data save"
   [ "$(shasum -a 256 "$work/sd/backups/switch/$newest" | cut -c1-64)" = "$lost" ] || fail "${how:-(no flags)}: the new data save differs from the data before the restore"
   [ -f "$work/sd/backups/switch/$second" ] || fail "${how:-(no flags)}: the restore removed the picked data save"
@@ -128,9 +137,10 @@ PY
   # save holds the flash from before the first install, which no package matches: it goes, and a copy takes its place)
   rm -f "$work/sd/backups/switch/$bin" "$work/sd/backups/switch/${bin%.bin}".txt
   cp "$work/sd/backups/switch/$second" "$work/sd/backups/switch/fm1-9-FM-1_015.bin"
-  cp "$work/sd/backups/switch/${second%.bin}.txt" "$work/sd/backups/switch/fm1-9-FM-1_015.txt"
-  oldest=$(ls "$work/sd/backups/switch" | grep '\.bin$' | grep 'FM-1_015' | sort -t- -k2 -n | head -1)
-  count=$(ls "$work/sd/backups/switch" | grep -c 'FM-1_015.*\.bin$' || true)
+  # (a copy that stands for an old data save: its .txt file has no number line and no default line)
+  grep -v '^number \|^default ' "$work/sd/backups/switch/${second%.bin}.txt" > "$work/sd/backups/switch/fm1-9-FM-1_015.txt"
+  oldest=$(by_number | tail -1 | cut -d' ' -f2)
+  count=$(grep -l '^firmware FM-1_015$' "$work"/sd/backups/switch/*.txt | wc -l | tr -d ' ')
   [ "$count" = 3 ] || fail "${how:-(no flags)}: $count data saves of FM-1_015, not 3"
   run $how --restore "$oldest" --save-first > /dev/null
   [ -f "$work/sd/backups/switch/$oldest" ] || fail "${how:-(no flags)}: the restore removed the picked data save, the oldest"

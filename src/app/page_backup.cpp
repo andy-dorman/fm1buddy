@@ -12,6 +12,7 @@
 #include "hal.h"
 #include "jobs.h"
 #include "midi.h"
+#include "savename.h"
 #include "uboot.h"
 #include "ui_priv.h"
 
@@ -112,23 +113,21 @@ void ui::backupPage(lv_obj_t* page) {
   // the backups
   lv_obj_t* h = label(body, "On the SD card (" BACKUPS_DIR ")", &lv_font_montserrat_14, t.text);
   lv_obj_set_style_pad_top(h, 6, 0);
-  std::vector<std::pair<std::string, uint32_t>> files;
+  std::vector<std::pair<savename::Numbered, uint32_t>> files;
   std::string dir = catalog::path(BACKUPS_DIR);
   if (DIR* dd = dir.empty() ? 0 : opendir(dir.c_str())) {
     while (dirent* e = readdir(dd)) {
       size_t n = strlen(e->d_name);
       struct stat st;
       if (n > 4 && !strcasecmp(e->d_name + n - 4, ".bin") && !stat((dir + "/" + e->d_name).c_str(), &st)) {
-        files.push_back({e->d_name, (uint32_t)st.st_size});
+        files.push_back({{e->d_name, savename::numberOfSaved(dir, e->d_name)}, (uint32_t)st.st_size});
       }
     }
     closedir(dd);
   }
-  std::sort(files.begin(), files.end(), [](auto& a, auto& b) {
-    long x = atol(a.first.c_str() + 4), y = atol(b.first.c_str() + 4);
-    return x != y ? x > y : a.first > b.first;
-  });
-  for (auto& [name, size] : files) {
+  std::sort(files.begin(), files.end(), [](auto& a, auto& b) { return savename::newer(a.first, b.first); });
+  for (auto& [numbered, size] : files) {
+    const std::string& name = numbered.name;
     lv_obj_t* r = box(body, LV_FLEX_FLOW_ROW);
     lv_obj_t* l = line(r, name.c_str(), &lv_font_montserrat_16, t.text);
     lv_obj_set_flex_grow(l, 1);

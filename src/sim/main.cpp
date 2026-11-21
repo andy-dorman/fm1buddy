@@ -1,7 +1,7 @@
 // The app on the desktop: an SDL window twice the screen's size, the mouse for touch.
 //
 //   program [--headless] [--zoom N] [--theme NAME] [--fm1] [--fomajam] [--sloop] [--sampler] [--kitten] [--smk] [--lostcal] [--bigscreen] [--faults] [--keys [N]] [--clock] [--install FILE]
-//           [--backup] [--recover FILE] [--restore FILE [--save-first] [--transfer]] [--uid N] [--lowmem] [--watchdog BYTES]
+//           [--backup [--name TEXT]] [--rename FILE TEXT] [--recover FILE] [--restore FILE [--save-first] [--transfer]] [--uid N] [--lowmem] [--watchdog BYTES]
 //           [--script "tap 24 70; wait 300; shot a.bmp; quit"]
 //
 // --fm1 puts a pretend FM-1 on the hub (it goes through a whole install), --fomajam makes it one running fomajam (it
@@ -9,7 +9,9 @@
 // and sends MIDI clock at 100 BPM).
 // --install FILE installs /fm1/FILE on the pretend FM-1, again (as a person would) if it doesn't finish, up to 3
 // times, then quits: 0 if it's installed, 1 if not.
-// --backup backs up the pretend FM-1's flash, --restore FILE (a .bin in /backups/switch) puts a data save's data
+// --backup backs up the pretend FM-1's flash (--name TEXT: under that own name), --rename FILE TEXT (FILE: a path such as
+// /backups/switch/X.bin, on the card) renames a saved file, logs the name that it used ("sim: renamed NAME"), then quits,
+// --restore FILE (a .bin in /backups/switch) puts a data save's data
 // sectors back on it (--save-first: a data save of the current data first; --transfer: the data save may be from another FM-1, and the matching package is installed first if the FM-1 runs another build; --uid N: the pretend FM-1 has another unique ID, flash head, and key_mac sector), --recover FILE (/fm1/X.fwsc or /backups/X.bin) recovers it (recovery mode, the key, the writes),
 // then quit: 0 if it went, 1 if not. Each logs its flash's sha256 after ("sim: flash").
 // --lowmem keeps big things on the SD card (memory.h lowMemory), as a board without PSRAM does (cardbuddy's), the SD
@@ -143,7 +145,7 @@ int main(int argc, char** argv) {
   int keys = 0;
   const char* themeName = 0;
   int zoom = 2;
-  std::string script, install, recoverFrom, restoreFrom;
+  std::string script, install, recoverFrom, restoreFrom, backupName, renameFile, renameTo;
   bool backup = false, saveFirst = false, transfer = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--headless")) {
@@ -156,6 +158,11 @@ int main(int argc, char** argv) {
       faults = true;
     } else if (!strcmp(argv[i], "--backup")) {
       backup = fm1 = true;
+    } else if (!strcmp(argv[i], "--name") && i + 1 < argc) {
+      backupName = argv[++i];
+    } else if (!strcmp(argv[i], "--rename") && i + 2 < argc) {
+      renameFile = argv[++i];
+      renameTo = argv[++i];
     } else if (!strcmp(argv[i], "--save-first")) {
       saveFirst = true;
     } else if (!strcmp(argv[i], "--transfer")) {
@@ -257,6 +264,13 @@ int main(int argc, char** argv) {
   bool dataSave = true;
 
   for (bool run = true; run;) {
+    if (!renameFile.empty()) {  // --rename: one call, then quit (it needs no FM-1)
+      size_t slash = renameFile.rfind('/');
+      bool ok = slash != std::string::npos && jobs::renameSaved(renameFile.substr(0, slash), renameFile.substr(slash + 1), renameTo);
+      hal::log(ok ? "sim: renamed %s" : "sim: not renamed: %s", ok ? jobs::saved.c_str() : jobs::error.c_str());
+      result = !ok;
+      break;
+    }
     if (win) {
       SDL_Event e;
       while (SDL_PollEvent(&e)) {
@@ -353,7 +367,7 @@ int main(int argc, char** argv) {
       bool over = phase && seen != jobs::finished;
       if (backup && !phase && fm1::current() >= 0) {
         hal::log("sim: backup");
-        seen = jobs::finished, phase = jobs::backup(fm1::current()) ? 1 : 9;
+        seen = jobs::finished, phase = jobs::backup(fm1::current(), backupName) ? 1 : 9;
       } else if (!restoreFrom.empty() && !phase && fm1::current() >= 0) {
         hal::log("sim: restore %s", restoreFrom.c_str());
         seen = jobs::finished, phase = jobs::restoreData(fm1::current(), restoreFrom, saveFirst, transfer) ? 4 : 9;
@@ -364,7 +378,9 @@ int main(int argc, char** argv) {
         hal::log("sim: recover");
         seen = jobs::finished, phase = jobs::recover() ? 3 : 9;
       } else if ((phase == 1 || phase == 3 || phase == 4) && over) {
-        hal::log("sim: %s: %s%s", phase == 1 ? "backup" : phase == 4 ? "restore" : "recover", jobs::ok ? "ok " : "failed: ",
+        hal::log("sim: %s: %s%s", phase == 1 ? "backup" : phase == 4 ? "restore"
+                                                                     : "recover",
+                 jobs::ok ? "ok " : "failed: ",
                  jobs::ok ? jobs::saved.c_str() : jobs::error.c_str());
         hal::log("sim: flash %s", fake::flashSha().c_str());
         result = !jobs::ok;

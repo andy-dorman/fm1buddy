@@ -9,6 +9,7 @@
 #include "catalog.h"
 #include "datasave.h"
 #include "hal.h"
+#include "savename.h"
 #include "sounds.h"
 
 namespace jobs {
@@ -109,16 +110,17 @@ extern std::string error;
 extern bool dataSaveFailed;
 extern std::string dataSaveUid;
 // DATA_RESTORE: why it stopped. Each one writes nothing, but sectorFailed
-extern bool anotherFm1;    // the data save is from another FM-1 (or has no unique ID)
-extern bool noPackage;     // no firmware in /fm1 is the firmware of the data save
-extern bool sectorFailed;  // a sector failed 3 times: the job stopped, and the flash may not start
+extern bool anotherFm1;           // the data save is from another FM-1 (or has no unique ID)
+extern bool noPackage;            // no firmware in /fm1 is the firmware of the data save
+extern bool sectorFailed;         // a sector failed 3 times: the job stopped, and the flash may not start
 extern std::vector<hal::Ap> aps;  // SCAN
 extern FwList hub;                // HUB: the new list
 extern std::string hubUpdated;
 extern int device;             // PROBE, SEND, VOICE, KEEP, RESTORE: the device
 extern sounds::Speaks speaks;  // PROBE
 extern std::string saved;      // VOICE: the file it went into; KEEP: the setup; EXPORT: what it did; BACKUP, RECOVER: its
-                               // backup's file; SLOOP_BACKUP: the backup; SLOOP_RESTORE: the backup made first; SLOOP_SONG: the
+                               // backup's file; renameSaved: the name that it used; SLOOP_BACKUP: the backup;
+                               // SLOOP_RESTORE: the backup made first; SLOOP_SONG: the
                                // song file; SLOOP_SONG_IN: the song saved first; DOWNLOAD, INSTALL, FW_UPDATE: its file
                                // in /fm1 (another name, if the Hub's was another firmware's on the SD card); SYNC: a
                                // line for each report of an extra source (Shrub, the sampler): not found, skipped, failed
@@ -141,11 +143,15 @@ bool sync();
 void cancel();
 bool probe(int d);
 bool send(int d, const std::string& file);  // in /syx
-bool voice(int d);
-bool keep(int d);
+// device d's voice into /syx, and its song and kits into /setups. name: the name that the user typed ("" gives the
+// default name). Another text is cleaned as an own name. The file gets the free name of its folder
+bool voice(int d, const std::string& name = "");
+bool keep(int d, const std::string& name = "");
 bool restore(int d, const std::string& setup);  // in /setups
 bool exportSetup(const std::string& setup, const char* app);
-bool backup(int d);    // device d: the FM-1
+// device d: the FM-1. name: the name that the user typed for the backup ("" gives the default name). Another text is
+// cleaned as an own name, and the backup gets the free name of /backups
+bool backup(int d, const std::string& name = "");
 // the data sectors of a data save (file: a .bin in /backups/switch) back on device d, the FM-1 (alone on the hub). It
 // refuses, before it writes anything, what datasave::refusal says (error says why), and a data save that no firmware
 // of /fm1 matches. It first reads the unique ID and stops (anotherFm1) when the data save is from another FM-1.
@@ -158,6 +164,18 @@ bool backup(int d);    // device d: the FM-1
 bool restoreData(int d, const std::string& file, bool dataSaveFirst = false, bool transfer = false);
 // the data saves in /backups/switch, newest first (the list of the "Backup & recover" page)
 std::vector<datasave::Save> dataSaveList();
+// the default name stem of a saved file of this kind, made today: "Jiant-FM_2026-11-19", or "FM-1_2026-11-19" with an
+// empty identity (the firmware identity of the FM-1, from fm1::known). With no date: "Jiant-FM_no-date-4", with the N
+// of the next name with no date in the folder of the kind. The name page shows it
+std::string defaultName(savename::Kind kind, const std::string& identity);
+// a saved file to another name (no job: it refuses, and returns false, while a job runs). folder: where it is ("/backups",
+// "/backups/switch", "/syx", "/setups", "/sloop", "/sloop/songs"), file: its name now (a setup: its folder name), typed:
+// the text of the user. An empty text, or the current name, changes nothing. Else the file takes the own name of the
+// text, with the free name of the folder, and keeps its extension. In /backups and /backups/switch, the .txt file moves
+// with the .bin file; before that, each line that an old file lacks is written to the .txt file ("number": the N of the
+// old name, "default": the old file stem), and when that write fails, nothing is renamed. The name that it used goes
+// into saved (error says why it failed)
+bool renameSaved(const std::string& folder, const std::string& file, const std::string& typed);
 // the .bin file of the newest data save of the firmware product with this unique ID ("" if there is none)
 std::string dataSaveFor(const std::string& product, const std::string& uid);
 bool identify(int d);  // device d: the FM-1
@@ -172,11 +190,11 @@ void giveCalibration();
 bool recover();  // in recovery mode: put it on
 // SLOOP (sloop.h), on device d: a backup; a backup back (file, in /sloop); project from (0, 2..5) of a backup as project
 // to; a sample source (in /sloop/samples) into slot 0..3
-bool sloopBackup(int d);
+bool sloopBackup(int d, const std::string& name = "");
 bool sloopRestore(int d, const std::string& file);
 bool sloopProject(int d, const std::string& file, int from, int to);
-// its song to a new file in /sloop/songs; a song file (in /sloop/songs) onto it
-bool sloopSong(int d);
+// its song to a new file in /sloop/songs; a song file (in /sloop/songs) onto it. name: as for voice
+bool sloopSong(int d, const std::string& name = "");
 bool sloopSongIn(int d, const std::string& file);
 bool sloopSamples(int d, const std::string& source, int slot);
 // fm1buddy itself: its newest release for this board (FM1BUDDY_BIN), from the installer page. After CHECK_UPDATE:

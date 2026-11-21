@@ -13,27 +13,35 @@
 namespace datasave {
 // one data save in /backups/switch, from its .bin file and its .txt file
 struct Save {
-  std::string file;      // the .bin file name: "fm1-4-FM-1_904.bin"
-  std::string firmware;  // the firmware identity, from the "firmware" line of the .txt file: "FM-1_904"
-  std::string uid;       // the flash chip's unique ID, from the "flash id" line ("" if it has none)
-  std::string sha256;    // from the "sha256" line of the .txt file
+  std::string file;         // the .bin file name: "Jiant-FM_2026-11-19.bin", or an old name "fm1-4-FM-1_904.bin"
+  std::string firmware;     // the firmware identity, from the "firmware" line of the .txt file: "FM-1_904"
+  std::string uid;          // the flash chip's unique ID, from the "flash id" line ("" if it has none)
+  std::string sha256;       // from the "sha256" line of the .txt file
+  long number = 0;          // the save number, from the "number" line of the .txt file (0: it has none)
+  std::string defaultStem;  // the file stem that the job made, from the "default" line ("" if the .txt file has none)
 };
 
-// the number N of fm1-N-FW.bin: the higher, the newer (0 if the name has none)
-long age(const std::string& file);
+// the save number of a data save: the higher, the newer. Its "number" line, or the N of an old name "fm1-N-FW.bin"
+// when it has no "number" line (0 if it has neither)
+long age(const Save& save);
+
+// the data save has an own name: its "default" line holds another stem than its file name. A data save with no
+// "default" line has a default name
+bool hasOwnName(const Save& save);
 
 // the data save of one .bin file, from the text of its .txt file (a missing line leaves its value empty)
 Save fromText(const std::string& file, const std::string& txt);
 
-// the rows of the list of data saves: the newest first (by the number N of the file name, as a number)
+// the rows of the list of data saves: the newest first (by the save number, as a number)
 std::vector<Save> newestFirst(const std::vector<Save>& saves);
 
 // the data save comes from the FM-1 that has this unique ID. A data save with no unique ID comes from no known FM-1,
 // and an empty unique ID is no FM-1 either
 bool sameFm1(const Save& save, const std::string& uid);
 
-// the .bin and the .txt file names to remove: for each firmware identity, all but the DATA_SAVES_KEPT newest. The data
-// save named keep (a .bin file name) is never removed, and it takes no place among the newest. Another firmware
+// the .bin and the .txt file names to remove: for each firmware identity, all but the DATA_SAVES_KEPT newest data saves
+// with a default name. A data save with an own name is never removed, and it takes no place among the newest. The data
+// save named keep (a .bin file name) is never removed either, and it takes no place among the newest. Another firmware
 // identity never loses a file
 std::vector<std::string> toRemove(const std::vector<Save>& saves, const std::string& keep = "");
 
@@ -49,9 +57,9 @@ struct Package {
 
 // the facts of one restore. The boot loader gives chipKey, flashId, and flashSize
 struct Restore {
-  uint32_t fileSize;       // the .bin file of the data save
-  std::string fileSha256;  // the SHA-256 of that .bin file, as the job computed it
-  std::string savedSha256; // the SHA-256 in the .txt file
+  uint32_t fileSize;        // the .bin file of the data save
+  std::string fileSha256;   // the SHA-256 of that .bin file, as the job computed it
+  std::string savedSha256;  // the SHA-256 in the .txt file
   uint16_t chipKey;
   uint32_t flashId;  // not a reason to refuse: each maker's flash part is the same type
   uint32_t flashSize;

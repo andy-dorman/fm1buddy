@@ -2,7 +2,7 @@
 // request at a time, each answered once): backups in SLOOP's own file, so they open in its web editor and its
 // backups open here; restoring one; loading a project from one; and .wav files into its user sample slots.
 //
-// Backups need SLOOP 2.3 (protocol 6) or later. They're kept on the SD card in /sloop, as backup-N.json
+// Backups need SLOOP 2.3 (protocol 6) or later. They're kept on the SD card in /sloop, as <name>.json
 // ({"format": "sloop-backup", "version": 1, "firmware", "date", "objects": [{"id", "len", "crc", "data"}]}); the
 // sample folders are in /sloop/samples (a folder of .wav files, or one .wav, makes a slot: each file a key zone, its
 // root note from its name, bass_C2.wav). Songs (SLOOP 2.7's "Export this song": the working loop, sections A-D and
@@ -69,18 +69,21 @@ typedef void (*Progress)(uint32_t done, uint32_t total);
 // these block (a job's thread); each returns 0, or what went wrong
 const char* info(int d, Info& out);
 const char* slots(int d, std::vector<Slot>& out);
-// all of it to a new backup file (its name into saved; prefix "backup" or "before-restore")
-const char* backup(int d, const Info& info, std::string& saved, Progress p, const char* prefix = "backup");
+// all of it to a new backup file named stem (stem-2 ... when it is taken; its name into saved)
+const char* backup(int d, const Info& info, std::string& saved, Progress p, const std::string& stem);
 // a backup back onto it: its banks, projects, the working project, the settings, then the samples (backed up first,
-// into before-restore-N.json: its name in savedFirst)
-const char* restore(int d, const std::string& name, std::string& savedFirst, Progress p);
+// into a backup file named beforeStem: its name in savedFirst)
+const char* restore(int d, const std::string& name, std::string& savedFirst, Progress p,
+                    const std::string& beforeStem);
 // one project of a backup (id 0: the working one, 2..5: A..D) onto it, as project to (the same ids)
 const char* loadProject(int d, const std::string& name, int from, int to, Progress p);
-// the song on it to a new song file (its name into saved; prefix "song" or "before-song")
-const char* saveSong(int d, const Info& info, std::string& saved, Progress p, const char* prefix = "song");
+// the song on it to a new song file named stem (stem-2 ... when it is taken; its name into saved). The name inside the
+// file is the stem that it saved as
+const char* saveSong(int d, const Info& info, std::string& saved, Progress p, const std::string& stem);
 // a song file onto it (stopped): the sections, the loop, then the order into its settings (the rest of them kept). The
-// song it had is saved first, into before-song-N.sloopsong: its name in savedFirst
-const char* loadSong(int d, const std::string& name, std::string& savedFirst, Progress p);
+// song it had is saved first, into a song file named beforeStem: its name in savedFirst
+const char* loadSong(int d, const std::string& name, std::string& savedFirst, Progress p,
+                     const std::string& beforeStem);
 // a sample source (sampleSources) into slot (0..3)
 const char* loadSamples(int d, const std::string& source, int slot, Progress p);
 }  // namespace sloop

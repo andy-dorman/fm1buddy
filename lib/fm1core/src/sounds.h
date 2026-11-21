@@ -1,7 +1,7 @@
 // Sounds: SysEx to and from the FM-1 (or any device on the hub), kept on the SD card as .syx files in /syx.
 //
 // Setups: a firmware that shares (fomajam, through foma's platform/src/share.c) gives its song, and its kits of
-// samples (kits.h). They're kept on the SD card in a setup, a folder in /setups (setup-1/fomajam.bin, fomajam-kits.bin,
+// samples (kits.h). They're kept on the SD card in a setup, a folder in /setups (Jiant-FM_2026-11-19/fomajam.bin, fomajam-kits.bin,
 // and kits/ for kits as folders of .wav files), and loaded back later: one setup per song played, say.
 //
 // Any firmware: a .syx file is sent as it is, and whatever the device sends is recorded into one (most firmwares that
@@ -54,14 +54,15 @@ struct File {
   uint32_t size;
   bool folder;
 };
-// what's in a folder of /syx ("": /syx itself, else "drums" or "drums/909"): its folders, then its .syx files, by name
+// what's in a folder of /syx ("": /syx itself, else "drums" or "drums/909"): its folders (A to Z), then its .syx files,
+// the newest first (savename::newer)
 std::vector<File> list(const std::string& folder = "");
 // name: its path in /syx ("bank.syx", "drums/909.syx")
 bool load(const std::string& name, std::vector<uint8_t>& out);
-// as /syx/<prefix>-N.syx (the next N); "" if it didn't save
-std::string save(const std::vector<uint8_t>& data, const char* prefix);
+// as /syx/<stem>.syx (stem, then stem-2 ... when the name is taken); "" if it didn't save
+std::string save(const std::vector<uint8_t>& data, const std::string& stem);
 
-// the setups (folders in /setups), by name
+// the setups (folders in /setups), the newest first (savename::newer)
 std::vector<std::string> setups();
 enum SetupPart { SONG_FILE,      // fomajam.bin
                  KITS_FILE,      // fomajam-kits.bin
@@ -82,8 +83,9 @@ void probe(int d, Speaks& out);
 const char* send(int d, const std::vector<uint8_t>& data, void (*progress)(uint32_t done, uint32_t total));
 // the stock firmware's current voice, as a DX7 single-voice .syx; 0 or an error
 const char* readVoice(int d, std::vector<uint8_t>& syx);
-// device d's song and kits into a new setup (setup-N, its name in setup); 0 or an error. *step: 0 the song, 1 the kits
-const char* keep(int d, std::string& setup, void (*progress)(uint32_t done, uint32_t total), int* step);
+// device d's song and kits into a new setup, a folder of /setups named stem (stem-2 ... when it is taken; its name in
+// setup); 0 or an error. *step: 0 the song, 1 the kits
+const char* keep(int d, const std::string& stem, std::string& setup, void (*progress)(uint32_t done, uint32_t total), int* step);
 // for other gear: a setup's patterns as MIDI files in midi/ (songmidi.h), and its kits (as kept) as .wav files in
 // kits/; 0 or an error, and what it did in done
 const char* exportSetup(const std::string& setup, const char* app, std::string& done);

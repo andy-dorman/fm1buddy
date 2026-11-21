@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include "fm1.h"
 #include "memory.h"
 #include "midi.h"
+#include "savename.h"
 #include "settings.h"
 #include "sloop.h"
 #include "syncplan.h"
@@ -1100,6 +1102,10 @@ static void sendJob(void*) {
   finish(true);
 }
 
+static std::string stemOfJob(savename::Kind kind, int d, const std::string& typed, const std::string& word = "");
+
+static std::string voiceName;  // VOICE: the name that the user typed ("" for the default name)
+
 static void voiceJob(void*) {
   step = ASKING_IT;
   std::vector<uint8_t> syx;
@@ -1107,19 +1113,20 @@ static void voiceJob(void*) {
     error = e;
     return finish(false);
   }
-  saved = sounds::save(syx, "voice");
+  saved = sounds::save(syx, stemOfJob(savename::VOICE, device, voiceName));
   if (saved.empty()) {
     error = "Can't write it to the SD card.";
   }
   finish(!saved.empty());
 }
 
-static int phase;  // KEEP, RESTORE: where it's at (sounds.h)
+static int phase;             // KEEP, RESTORE: where it's at (sounds.h)
+static std::string keepName;  // KEEP: the name that the user typed ("" for the default name)
 
 static void keepJob(void*) {
   step = GETTING;
   total = 0;
-  if (const char* e = sounds::keep(device, saved, progress, &phase)) {
+  if (const char* e = sounds::keep(device, stemOfJob(savename::SETUP, device, keepName), saved, progress, &phase)) {
     error = e;
     return finish(false);
   }
@@ -1384,34 +1391,108 @@ static bool readFlash(int d, bool smkScreen, const char* title, const char* what
   return !e;
 }
 
-// a flash as dir/fm1-N-FW.bin (its name into saved), and what it was (fm1-N-FW.txt). FW: the firmware it ran
-// ("FM-1_904"), when that's known. N comes first (the lists sort by it). head: the first line of the .txt ("" says it's
-// a backup). last: the file of the install before, when there is one. build: the build ID of the firmware ("" writes no
-// line). With alive: the loader is still running, and
-// kept so (the card can take longer than it waits)
+static std::string lastInstall();
+
+// the file names of a folder, and the save number of each .bin file
+static void listFolder(const std::string& dir, std::vector<std::string>& names, std::vector<savename::Numbered>& bins) {
+  DIR* dd = opendir(dir.c_str());
+  while (dd) {
+    dirent* e = readdir(dd);
+    if (!e) {
+      break;
+    }
+    std::string name = e->d_name;
+    names.push_back(name);
+    if (name.size() > 4 && !strcasecmp(name.c_str() + name.size() - 4, ".bin")) {
+      bins.push_back({name, savename::numberOfSaved(dir, name)});
+    }
+  }
+  if (dd) {
+    closedir(dd);
+  }
+}
+
+// the display name and the product of the package that the newest install record names (both "" if there is none).
+// It reads the SD list through sdFind and sdAt, so it works when the list stays on the card, and it holds the lock of
+// the list while the page swaps it
+static void installedPackage(std::string& displayName, std::string& product) {
+  std::string file = lastInstall();
+  if (file.empty())
+    return;
+  int at = catalog::sdFind(file.c_str());
+  FwList one;
+  if (at < 0 || !catalog::sdAt(at, one) || one.size() == 0)
+    return;
+  displayName = one.str(one[0].name);
+  product = one.str(one[0].product);
+}
+
+// the folder of a kind of saved file
+static const char* folderOf(savename::Kind kind) {
+  switch (kind) {
+    case savename::DATA_SAVE:
+      return DATA_SAVES_DIR;
+    case savename::BACKUP:
+      return BACKUPS_DIR;
+    case savename::VOICE:
+      return SYX_DIR;
+    case savename::SETUP:
+      return SETUPS_DIR;
+    case savename::SLOOP_BACKUP:
+      return SLOOP_DIR;
+    default:
+      return SLOOP_SONGS_DIR;
+  }
+}
+
+// the default name stem of a saved file of this kind, made today: its firmware part, its date, and the N of the next
+// name with no date in its folder. identity: the firmware identity of the FM-1 ("" if none). word: "before-restore"
+static std::string stemFor(savename::Kind kind, const std::string& identity, bool smk, const std::string& word = "") {
+  std::string dir = catalog::path(folderOf(kind));
+  std::vector<std::string> names;
+  std::vector<savename::Numbered> bins;
+  listFolder(dir, names, bins);
+  long number = kind == savename::DATA_SAVE || kind == savename::BACKUP ? savename::nextSaveNumber(bins) : savename::nextNumber(names);
+  std::string displayName, product;
+  installedPackage(displayName, product);
+  return savename::defaultStem(savename::firmwarePart(identity, displayName, product, smk), savename::dateText(time(0)),
+                               number, word);
+}
+
+std::string jobs::defaultName(savename::Kind kind, const std::string& identity) {
+  return stemFor(kind, identity, false);
+}
+
+// the stem that a job of this kind saves with, for device d: the name that the user typed, or the default name
+static std::string stemOfJob(savename::Kind kind, int d, const std::string& typed, const std::string& word) {
+  const Fm1Id* id = fm1::known(d);
+  return savename::stemOf(typed, stemFor(kind, id ? id->text : "", id && isSmk(id->model), word));
+}
+
+// a flash as dir/FW_DATE.bin (its name into saved), and what it was (FW_DATE.txt): the default name, with the firmware
+// part and the date of today ("Jiant-FM_2026-11-19"; a second one that day gets -2). FW: the firmware it ran
+// ("FM-1_904"), when that's known. word: a word after the date ("before-recovery"; "" for none). head: the first line
+// of the .txt ("" says it's a backup). last: the file of the install before, when there is one. build: the build ID of
+// the firmware ("" writes no line). The .txt has the save number (the lists sort by it), and in a data save the stem of
+// the name that the job made. With alive: the loader is still running, and kept so (the card can take longer than it
+// waits). own: the name that the user typed ("" for the default name; any other text is cleaned as an own name)
 static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::string& was, bool alive,
                        const std::string& fw = "", const char* folder = BACKUPS_DIR, const std::string& head = "",
-                       const std::string& last = "", const std::string& build = "") {
+                       const std::string& last = "", const std::string& build = "", const std::string& word = "",
+                       const std::string& own = "") {
   mkdir(catalog::path(BACKUPS_DIR).c_str(), 0777);
   std::string dir = catalog::path(folder);
   mkdir(dir.c_str(), 0777);
-  bool smk = smkIn(a);
-  const char* prefix = smk ? "smk-" : "fm1-";  // (an SMK-37's has its calibration: uboot.h)
-  // N: one past the highest there (with or without a firmware in its name)
-  int n = 1;
-  if (DIR* dd = opendir(dir.c_str())) {
-    while (dirent* e = readdir(dd)) {
-      if (!strncasecmp(e->d_name, prefix, 4)) {
-        n = std::max(n, atoi(e->d_name + 4) + 1);
-      }
-    }
-    closedir(dd);
-  }
-  std::string tag;  // the firmware, safe for a file name ("SMK-37 Elite_016" -> "SMK-37-Elite_016")
-  for (char c : fw) {
-    tag += isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' ? c : '-';
-  }
-  std::string stem = prefix + std::to_string(n) + (tag.empty() ? "" : "-" + tag);
+  bool smk = smkIn(a);  // (an SMK-37's has its calibration: uboot.h)
+  std::vector<std::string> taken;
+  std::vector<savename::Numbered> bins;
+  listFolder(dir, taken, bins);
+  long number = savename::nextSaveNumber(bins);
+  std::string displayName, product;
+  installedPackage(displayName, product);
+  std::string made =
+      savename::defaultStem(savename::firmwarePart(fw, displayName, product, smk), savename::dateText(time(0)), number, word);
+  std::string stem = savename::freeName(savename::stemOf(own, made), ".bin", taken);
   std::string base = dir + "/" + stem;
   saved = stem + ".bin";
   char sha[65] = "";
@@ -1441,6 +1522,10 @@ static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::st
     if (ok && !build.empty()) {
       ok = fprintf(f, "build    %s\n", build.c_str()) > 0;
     }
+    ok = ok && fprintf(f, "number %ld\n", number) > 0;
+    if (ok && !strcmp(folder, DATA_SAVES_DIR)) {
+      ok = fprintf(f, "default %s\n", stem.c_str()) > 0;
+    }
     ok &= f && !fclose(f);
   }
   if (!ok) {
@@ -1448,6 +1533,8 @@ static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::st
   }
   return ok;
 }
+
+static std::string backupName;  // BACKUP: the name that the user typed ("" for the default name)
 
 static void backupJob(void*) {
   if (!hal::sd()) {
@@ -1462,7 +1549,7 @@ static void backupJob(void*) {
   if (!readFlash(device, id && isSmk(id->model), "BACKUP", "backup", chip, a)) {
     return finish(false);
   }
-  finish(saveBackup(a, chip, was, false, was));
+  finish(saveBackup(a, chip, was, false, was, BACKUPS_DIR, "", "", "", "", backupName));
 }
 
 // IDENTIFY: into its boot loader and straight back, for what it says of its chip (uboot::attach keeps it: lastChip)
@@ -1502,11 +1589,12 @@ bool jobs::identify(int d) {
   return start(IDENTIFY, identifyJob);
 }
 
-bool jobs::backup(int d) {
+bool jobs::backup(int d, const std::string& name) {
   if (running) {
     return false;
   }
   device = d;
+  backupName = name;
   reading = 0;
   mapClear();
   return start(BACKUP, backupJob);
@@ -1824,7 +1912,7 @@ static void recoverJob(void*) {
   if (!e) {
     fmShow("SAVING A BACKUP", 30, true);
     step = SAVING;
-    e = saveBackup(now, chip, "before recovery", true) ? 0 : error.c_str();
+    e = saveBackup(now, chip, "before recovery", true, "", BACKUPS_DIR, "", "", "", "before-recovery") ? 0 : error.c_str();
   }
   // an FM-1 and an SMK-37 look the same to here: what's on its flash says which it is. The SMK-37's calibration is
   // its own (never written): another SMK-37's backup goes on it with its own calibration kept
@@ -1949,9 +2037,9 @@ bool jobs::recover() {
 }
 
 // ------------------------------------------------------------------------------- the data restore ---
-static FILE* restoreBin;             // DATA_RESTORE: the .bin file of the data save
-static const FlashBuf* restoreNow;   // the flash as it was read
-static uint32_t restoreFrom;         // the first sector that it writes
+static FILE* restoreBin;            // DATA_RESTORE: the .bin file of the data save
+static const FlashBuf* restoreNow;  // the flash as it was read
+static uint32_t restoreFrom;        // the first sector that it writes
 
 static bool binRead(uint32_t at, uint8_t* out, uint32_t n) {
   if (!restoreBin || fseek(restoreBin, at, SEEK_SET) || fread(out, 1, n, restoreBin) != n) {
@@ -2121,7 +2209,7 @@ static void restoreDataJob(void*) {
   }
   // every refusal comes before the first write
   datasave::TransferPath route = datasave::TRANSFER_WRITE;
-  std::string package;  // a transfer: the file in /fm1 that gets installed
+  std::string package;    // a transfer: the file in /fm1 that gets installed
   uint32_t imageEnd = 0;  // the image end of the matching package (0: none)
   if (!e) {
     if (r.fileSize == 1024 * 1024) {
@@ -2269,6 +2357,126 @@ std::vector<datasave::Save> jobs::dataSaveList() {
   return datasave::newestFirst(dataSaves());
 }
 
+// the whole text of a file ("" when it has none)
+static bool readWhole(const std::string& path, std::string& all) {
+  FILE* f = fopen(path.c_str(), "r");
+  all.clear();
+  if (!f) {
+    return false;
+  }
+  char chunk[200];
+  for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) {
+    all.append(chunk, n);
+  }
+  fclose(f);
+  return true;
+}
+
+static bool hasLine(const std::string& text, const char* start) {
+  size_t n = strlen(start);
+  for (size_t at = 0; at < text.size();) {
+    if (!text.compare(at, n, start)) {
+      return true;
+    }
+    size_t end = text.find('\n', at);
+    at = end == std::string::npos ? text.size() : end + 1;
+  }
+  return false;
+}
+
+// the "number" line and the "default" line that the .txt file of an old file lacks: number is the N of its old name,
+// stem its file stem. An old backup with no .txt file gets a new one. False: the write failed, and nothing changed
+// in the name of the file
+static bool completeText(const std::string& path, const std::string& file, const std::string& stem) {
+  std::string text;
+  bool had = readWhole(path, text);
+  std::string add;
+  long number = savename::saveNumber({file, 0});
+  if (number > 0 && !hasLine(text, "number ")) {
+    add += "number " + std::to_string(number) + "\n";
+  }
+  if (!hasLine(text, "default ")) {
+    add += "default " + stem + "\n";
+  }
+  if (add.empty()) {
+    return true;
+  }
+  if (!text.empty() && text.back() != '\n') {
+    add = "\n" + add;
+  }
+  FILE* f = fopen(path.c_str(), had ? "a" : "w");
+  bool ok = f && fwrite(add.data(), 1, add.size(), f) == add.size();
+  ok &= f && !fclose(f);
+  return ok;
+}
+
+// a file to another name. A name that differs only in its case goes through a temporary name: the card ignores the case
+static bool moveFile(const std::string& from, const std::string& to, bool throughTemp) {
+  if (!throughTemp) {
+    return !rename(from.c_str(), to.c_str());
+  }
+  std::string temp = to + ".tmp";
+  if (rename(from.c_str(), temp.c_str())) {
+    return false;
+  }
+  if (rename(temp.c_str(), to.c_str())) {
+    rename(temp.c_str(), from.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool jobs::renameSaved(const std::string& folder, const std::string& file, const std::string& typed) {
+  if (running) {
+    error = "Wait until the job is done.";
+    return false;
+  }
+  error.clear();
+  std::string dir = catalog::path(folder);
+  bool isFolder = folder == SETUPS_DIR;  // a setup is a folder; each other kind is a file with an extension
+  size_t dot = isFolder ? std::string::npos : file.rfind('.');
+  std::string ext = dot == std::string::npos || !dot ? "" : file.substr(dot);
+  std::string stem = file.substr(0, file.size() - ext.size());
+  bool pair = folder == BACKUPS_DIR || folder == DATA_SAVES_DIR;  // a .bin file and its .txt file
+  std::vector<std::string> taken;
+  DIR* dd = opendir(dir.c_str());
+  while (dd) {
+    dirent* e = readdir(dd);
+    if (!e) {
+      break;
+    }
+    // the file itself blocks no name: a new name that differs only in its case is a rename
+    if (strcasecmp(e->d_name, file.c_str()) && !(pair && !strcasecmp(e->d_name, (stem + ".txt").c_str()))) {
+      taken.push_back(e->d_name);
+    }
+  }
+  if (dd) {
+    closedir(dd);
+  }
+  std::string to = savename::renameStem(stem, typed, ext, taken);
+  if (to == stem) {
+    saved = file;
+    return true;
+  }
+  // the lines that an old file lacks go first: when this write fails, nothing is renamed
+  if (pair && !completeText(dir + "/" + stem + ".txt", file, stem)) {
+    error = "Can't write it to the SD card.";
+    return false;
+  }
+  bool throughTemp = !strcasecmp(to.c_str(), stem.c_str());
+  bool ok = moveFile(dir + "/" + stem + ext, dir + "/" + to + ext, throughTemp);
+  if (ok && pair && !moveFile(dir + "/" + stem + ".txt", dir + "/" + to + ".txt", throughTemp)) {
+    moveFile(dir + "/" + to + ext, dir + "/" + stem + ext, throughTemp);
+    ok = false;
+  }
+  if (!ok) {
+    error = "Can't rename it on the SD card.";
+    return false;
+  }
+  saved = to + ext;
+  return true;
+}
+
 std::string jobs::dataSaveFor(const std::string& product, const std::string& uid) {
   return datasave::matchSave(dataSaves(), product, uid);
 }
@@ -2293,11 +2501,12 @@ bool jobs::exportSetup(const std::string& setup, const char* app) {
   return start(EXPORT, exportJob);
 }
 
-bool jobs::keep(int d) {
+bool jobs::keep(int d, const std::string& name) {
   if (running) {
     return false;
   }
   device = d;
+  keepName = name;
   phase = 0;
   return start(KEEP, keepJob);
 }
@@ -2329,11 +2538,12 @@ bool jobs::send(int d, const std::string& file) {
   return start(SEND, sendJob);
 }
 
-bool jobs::voice(int d) {
+bool jobs::voice(int d, const std::string& name) {
   if (running) {
     return false;
   }
   device = d;
+  voiceName = name;
   return start(VOICE, voiceJob);
 }
 
@@ -2353,6 +2563,7 @@ bool jobs::join(const char* s, const char* p) {
 // ------------------------------------------------------------------------------------------- SLOOP ---
 static std::string doing;  // WORKING: what ("Backing up")
 static std::string sloopFile;
+static std::string sloopName;  // SLOOP_BACKUP, SLOOP_SONG: the name that the user typed ("" for the default name)
 static int sloopFrom, sloopTo;
 
 static void sloopJob(void*) {
@@ -2364,11 +2575,12 @@ static void sloopJob(void*) {
     sloop::Info info;
     e = sloop::info(device, info);
     if (!e) {
-      e = sloop::backup(device, info, saved, progress);
+      e = sloop::backup(device, info, saved, progress, stemOfJob(savename::SLOOP_BACKUP, device, sloopName));
     }
   } else if (kind == SLOOP_RESTORE) {
     doing = "Backing it up, then restoring";
-    e = sloop::restore(device, sloopFile, saved, progress);
+    e = sloop::restore(device, sloopFile, saved, progress,
+                       stemOfJob(savename::SLOOP_BACKUP, device, "", "before-restore"));
   } else if (kind == SLOOP_PROJECT) {
     doing = "Loading the project";
     e = sloop::loadProject(device, sloopFile, sloopFrom, sloopTo, progress);
@@ -2377,11 +2589,12 @@ static void sloopJob(void*) {
     sloop::Info info;
     e = sloop::info(device, info);
     if (!e) {
-      e = sloop::saveSong(device, info, saved, progress);
+      e = sloop::saveSong(device, info, saved, progress, stemOfJob(savename::SLOOP_SONG, device, sloopName));
     }
   } else if (kind == SLOOP_SONG_IN) {
     doing = "Saving its song, then loading";
-    e = sloop::loadSong(device, sloopFile, saved, progress);
+    e = sloop::loadSong(device, sloopFile, saved, progress,
+                        stemOfJob(savename::SLOOP_SONG, device, "", "before-song"));
   } else {
     doing = "Loading the samples";
     e = sloop::loadSamples(device, sloopFile, sloopTo, progress);
@@ -2392,7 +2605,7 @@ static void sloopJob(void*) {
   finish(!e);
 }
 
-static bool sloopStart(Kind k, int d, const std::string& file, int from, int to) {
+static bool sloopStart(Kind k, int d, const std::string& file, int from, int to, const std::string& name = "") {
   if (running) {
     return false;
   }
@@ -2400,11 +2613,12 @@ static bool sloopStart(Kind k, int d, const std::string& file, int from, int to)
   sloopFile = file;
   sloopFrom = from;
   sloopTo = to;
+  sloopName = name;
   return start(k, sloopJob);
 }
 
-bool jobs::sloopBackup(int d) {
-  return sloopStart(SLOOP_BACKUP, d, "", 0, 0);
+bool jobs::sloopBackup(int d, const std::string& name) {
+  return sloopStart(SLOOP_BACKUP, d, "", 0, 0, name);
 }
 
 bool jobs::sloopRestore(int d, const std::string& file) {
@@ -2415,8 +2629,8 @@ bool jobs::sloopProject(int d, const std::string& file, int from, int to) {
   return sloopStart(SLOOP_PROJECT, d, file, from, to);
 }
 
-bool jobs::sloopSong(int d) {
-  return sloopStart(SLOOP_SONG, d, "", 0, 0);
+bool jobs::sloopSong(int d, const std::string& name) {
+  return sloopStart(SLOOP_SONG, d, "", 0, 0, name);
 }
 
 bool jobs::sloopSongIn(int d, const std::string& file) {

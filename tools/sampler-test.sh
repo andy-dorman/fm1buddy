@@ -49,8 +49,8 @@ for who in "fm1-sampler" "stock"; do
     if [ "$who" = "fm1-sampler" ]; then
       grep -q 'is FM-1_8000014' "$work/log" || fail "$name: the shared core did not find the fm1-sampler"
       case "$bin" in
-        *FM-1_8000014.bin) ;;
-        *) fail "$name: the data save $bin is not named for FM-1_8000014" ;;
+        FM-1_8000014_"$(date -u +%F)".bin) ;;
+        *) fail "$name: the data save $bin is not named FM-1_8000014_<date>.bin" ;;
       esac
       grep -q '^firmware FM-1_8000014$' "$txt" || fail "$name: the .txt file has no firmware identity FM-1_8000014"
       grep -q "^build    $BUILD_ID\$" "$txt" || fail "$name: the .txt file has no build line with the build ID"

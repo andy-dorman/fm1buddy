@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <thread>
 
 #include "catalog.h"
@@ -17,6 +18,7 @@
 #include "kits.h"
 #include "memory.h"
 #include "midi.h"
+#include "savename.h"
 #include "sloop.h"
 #include "songmidi.h"
 
@@ -120,12 +122,14 @@ sounds::Info sounds::describe(const std::vector<uint8_t>& data) {
 // --------------------------------------------------------------------------------------------- files ---
 std::vector<sounds::File> sounds::list(const std::string& folder) {
   std::vector<File> out;
+  std::map<std::string, uint32_t> sizes;  // of each .syx file
   std::string dir = catalog::path(SYX_DIR);
   dir += dir.empty() || folder.empty() ? "" : "/" + folder;
   DIR* d = dir.empty() ? 0 : opendir(dir.c_str());
   if (!d) {
     return out;
   }
+  std::vector<savename::Timed> times;  // the .syx files, with their file times
   while (dirent* e = readdir(d)) {
     size_t n = strlen(e->d_name);
     struct stat st;
@@ -134,13 +138,20 @@ std::vector<sounds::File> sounds::list(const std::string& folder) {
     }
     bool folder = S_ISDIR(st.st_mode);
     if (folder || (n >= 5 && !strcasecmp(e->d_name + n - 4, ".syx"))) {
-      out.push_back({e->d_name, (uint32_t)st.st_size, folder});
+      if (folder) {
+        out.push_back({e->d_name, (uint32_t)st.st_size, true});
+      } else {
+        times.push_back({e->d_name, st.st_mtime});
+        sizes[e->d_name] = (uint32_t)st.st_size;
+      }
     }
   }
   closedir(d);
-  std::sort(out.begin(), out.end(), [](const File& a, const File& b) {
-    return a.folder != b.folder ? a.folder : strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
-  });
+  std::sort(out.begin(), out.end(), [](const File& a, const File& b) { return strcasecmp(a.name.c_str(), b.name.c_str()) < 0; });
+  std::sort(times.begin(), times.end(), [](const savename::Timed& a, const savename::Timed& b) { return savename::newer(a, b); });
+  for (const savename::Timed& t : times) {
+    out.push_back({t.name, sizes[t.name], false});
+  }
   return out;
 }
 
@@ -162,30 +173,35 @@ bool sounds::load(const std::string& name, std::vector<uint8_t>& out) {
   return ok;
 }
 
-std::string sounds::save(const std::vector<uint8_t>& data, const char* prefix) {
+// the file names of a folder
+static std::vector<std::string> namesIn(const std::string& dir) {
+  std::vector<std::string> out;
+  if (DIR* d = opendir(dir.c_str())) {
+    while (dirent* e = readdir(d)) {
+      out.push_back(e->d_name);
+    }
+    closedir(d);
+  }
+  return out;
+}
+
+std::string sounds::save(const std::vector<uint8_t>& data, const std::string& stem) {
   std::string dir = catalog::path(SYX_DIR);
   if (dir.empty()) {
     return "";
   }
   mkdir(dir.c_str(), 0777);
-  struct stat st;
-  for (int n = 1; n < 1000; n++) {
-    std::string name = std::string(prefix) + "-" + std::to_string(n) + ".syx", p = dir + "/" + name;
-    if (!stat(p.c_str(), &st)) {
-      continue;
-    }
-    FILE* f = fopen(p.c_str(), "wb");
-    if (!f) {
-      return "";
-    }
-    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
-    ok &= !fclose(f);
-    if (!ok) {
-      remove(p.c_str());
-    }
-    return ok ? name : "";
+  std::string name = savename::freeName(stem, ".syx", namesIn(dir)) + ".syx", p = dir + "/" + name;
+  FILE* f = fopen(p.c_str(), "wb");
+  if (!f) {
+    return "";
   }
-  return "";
+  bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+  ok &= !fclose(f);
+  if (!ok) {
+    remove(p.c_str());
+  }
+  return ok ? name : "";
 }
 
 // ------------------------------------------------------------------------------------------- talking ---
@@ -441,14 +457,18 @@ std::vector<std::string> sounds::setups() {
   if (!d) {
     return out;
   }
+  std::vector<savename::Timed> times;
   while (dirent* e = readdir(d)) {
     struct stat st;
     if (e->d_name[0] != '.' && !stat((dir + "/" + e->d_name).c_str(), &st) && S_ISDIR(st.st_mode)) {
-      out.push_back(e->d_name);
+      times.push_back({e->d_name, st.st_mtime});
     }
   }
   closedir(d);
-  std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) { return strcasecmp(a.c_str(), b.c_str()) < 0; });
+  std::sort(times.begin(), times.end(), [](const savename::Timed& a, const savename::Timed& b) { return savename::newer(a, b); });
+  for (const savename::Timed& t : times) {
+    out.push_back(t.name);
+  }
   return out;
 }
 
@@ -507,7 +527,7 @@ sounds::Setup sounds::setup(const std::string& name, const char* app) {
   return s;
 }
 
-const char* sounds::keep(int d, std::string& setup, void (*progress)(uint32_t, uint32_t), int* step) {
+const char* sounds::keep(int d, const std::string& stem, std::string& setup, void (*progress)(uint32_t, uint32_t), int* step) {
   Speaks s = {};
   if (!shareInfo(d, s, 3)) {
     return "It didn't answer.";
@@ -533,13 +553,7 @@ const char* sounds::keep(int d, std::string& setup, void (*progress)(uint32_t, u
     return "No SD card.";
   }
   mkdir(dir.c_str(), 0777);
-  struct stat st;
-  for (int n = 1; n < 1000; n++) {
-    setup = "setup-" + std::to_string(n);
-    if (stat((dir + "/" + setup).c_str(), &st)) {
-      break;
-    }
-  }
+  setup = savename::freeName(stem, "", namesIn(dir));
   mkdir((dir + "/" + setup).c_str(), 0777);
   if (!saveFile(setupFile(setup, s.app, SONG_FILE), song) || (!bank.empty() && !saveFile(setupFile(setup, s.app, KITS_FILE), bank))) {
     return "Can't write it to the SD card.";

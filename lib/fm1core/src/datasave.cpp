@@ -1,5 +1,6 @@
 #include "datasave.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -10,18 +11,28 @@
 // the same addresses as uboot.h (this module calls no uboot function)
 namespace datasave {
 namespace {
-  const uint32_t SECTOR_BYTES = 0x1000;
-  const uint32_t FLASH_BYTES = 0x100000;  // 1 MiB
-  const uint32_t FIRMWARE_FROM = 0x4000;  // below it is the flash head, which no restore writes
-  const uint32_t KEY_MAC_AT = 0xFF000;    // from it up is key_mac, which no restore writes
-  const uint32_t SMK37_MARK_AT = 0xC1224;
-  const uint16_t FM1_CHIP_KEY = 0x980F;
+const uint32_t SECTOR_BYTES = 0x1000;
+const uint32_t FLASH_BYTES = 0x100000;  // 1 MiB
+const uint32_t FIRMWARE_FROM = 0x4000;  // below it is the flash head, which no restore writes
+const uint32_t KEY_MAC_AT = 0xFF000;    // from it up is key_mac, which no restore writes
+const uint32_t SMK37_MARK_AT = 0xC1224;
+const uint16_t FM1_CHIP_KEY = 0x980F;
 }  // namespace
 }  // namespace datasave
 
-// the number after the 4-character prefix ("fm1-", "smk-")
-long datasave::age(const std::string& file) {
-  return file.size() > 4 ? atol(file.c_str() + 4) : 0;
+// the N of an old name ("fm1-4-FM-1_904.bin", "smk-9.bin"): 0 for any other name
+static long oldNumber(const std::string& file) {
+  bool old = !strncasecmp(file.c_str(), "fm1-", 4) || !strncasecmp(file.c_str(), "smk-", 4);
+  return old && file.size() > 4 && isdigit((unsigned char)file[4]) ? atol(file.c_str() + 4) : 0;
+}
+
+long datasave::age(const Save& save) {
+  return save.number ? save.number : oldNumber(save.file);
+}
+
+bool datasave::hasOwnName(const Save& save) {
+  bool bin = save.file.size() > 4 && !strcasecmp(save.file.c_str() + save.file.size() - 4, ".bin");
+  return !save.defaultStem.empty() && (bin ? save.file.substr(0, save.file.size() - 4) : save.file) != save.defaultStem;
 }
 
 // the name of the .txt file of a .bin file
@@ -33,14 +44,14 @@ static std::string textOf(const std::string& file) {
 std::vector<std::string> datasave::toRemove(const std::vector<Save>& saves, const std::string& keep) {
   std::map<std::string, std::vector<const Save*>> byFirmware;
   for (const Save& s : saves) {
-    if (s.file != keep) {
+    if (s.file != keep && !hasOwnName(s)) {
       byFirmware[s.firmware].push_back(&s);
     }
   }
   std::vector<std::string> out;
   for (auto& group : byFirmware) {
     std::vector<const Save*>& list = group.second;
-    std::stable_sort(list.begin(), list.end(), [](const Save* a, const Save* b) { return age(a->file) > age(b->file); });
+    std::stable_sort(list.begin(), list.end(), [](const Save* a, const Save* b) { return age(*a) > age(*b); });
     for (size_t i = DATA_SAVES_KEPT; i < list.size(); i++) {
       out.push_back(list[i]->file);
       out.push_back(textOf(list[i]->file));
@@ -68,6 +79,10 @@ datasave::Save datasave::fromText(const std::string& file, const std::string& tx
       save.uid = line.substr(9);
     } else if (line.compare(0, 9, "sha256   ") == 0) {
       save.sha256 = line.substr(9);
+    } else if (line.compare(0, 7, "number ") == 0) {
+      save.number = atol(line.c_str() + 7);
+    } else if (line.compare(0, 8, "default ") == 0) {
+      save.defaultStem = line.substr(8);
     }
   }
   return save;
@@ -76,7 +91,7 @@ datasave::Save datasave::fromText(const std::string& file, const std::string& tx
 std::vector<datasave::Save> datasave::newestFirst(const std::vector<Save>& saves) {
   std::vector<Save> out = saves;
   std::stable_sort(out.begin(), out.end(), [](const Save& a, const Save& b) {
-    long x = age(a.file), y = age(b.file);
+    long x = age(a), y = age(b);
     return x != y ? x > y : a.file < b.file;
   });
   return out;
@@ -91,7 +106,7 @@ namespace datasave {
 std::string matchSave(const std::vector<Save>& saves, const std::string& product, const std::string& uid) {
   const Save* best = nullptr;
   for (const Save& s : saves) {
-    if (!uid.empty() && s.uid == uid && s.firmware == product && (!best || age(s.file) > age(best->file))) {
+    if (!uid.empty() && s.uid == uid && s.firmware == product && (!best || age(s) > age(*best))) {
       best = &s;
     }
   }

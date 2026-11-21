@@ -17,6 +17,7 @@
 #include "hal.h"
 #include "memory.h"
 #include "midi.h"
+#include "savename.h"
 #include "sloopfmt.h"
 
 using namespace sloopfmt;
@@ -182,17 +183,26 @@ std::string sloop::objectName(int id) {
   return "object " + std::to_string(id);
 }
 
-static std::vector<std::string> listDir(const std::string& dir, bool (*want)(const std::string&, bool)) {
-  std::vector<std::string> out;
+// the files of a folder that want() takes (it gets the name, and whether it is a folder), each with its file time
+static std::vector<savename::Timed> listTimed(const std::string& dir, bool (*want)(const std::string&, bool)) {
+  std::vector<savename::Timed> out;
   if (DIR* d = dir.empty() ? 0 : opendir(dir.c_str())) {
     while (dirent* e = readdir(d)) {
       std::string n = e->d_name;
       struct stat st;
       if (n[0] != '.' && !stat((dir + "/" + n).c_str(), &st) && want(n, S_ISDIR(st.st_mode))) {
-        out.push_back(n);
+        out.push_back({n, st.st_mtime});
       }
     }
     closedir(d);
+  }
+  return out;
+}
+
+static std::vector<std::string> listDir(const std::string& dir, bool (*want)(const std::string&, bool)) {
+  std::vector<std::string> out;
+  for (const savename::Timed& t : listTimed(dir, want)) {
+    out.push_back(t.name);
   }
   return out;
 }
@@ -202,29 +212,25 @@ static bool ends(const std::string& s, const char* e) {
   return s.size() > k && !strcasecmp(s.c_str() + s.size() - k, e);
 }
 
-// the newest first: by the number in the name, then the name
-static void newestFirst(std::vector<std::string>& v) {
-  auto num = [](const std::string& s) {
-    size_t i = s.find_first_of("0123456789");
-    return i == std::string::npos ? 0L : atol(s.c_str() + i);
-  };
-  std::sort(v.begin(), v.end(), [&](const std::string& a, const std::string& b) {
-    return num(a) != num(b) ? num(a) > num(b) : a > b;
-  });
+// the names of the files, the newest first (savename::newer)
+static std::vector<std::string> newestFirst(std::vector<savename::Timed> files) {
+  std::sort(files.begin(), files.end(), [](const savename::Timed& a, const savename::Timed& b) { return savename::newer(a, b); });
+  std::vector<std::string> out;
+  for (const savename::Timed& f : files) {
+    out.push_back(f.name);
+  }
+  return out;
 }
 
 std::vector<std::string> sloop::backups() {
-  auto v = listDir(catalog::path(SLOOP_DIR), [](const std::string& n, bool dir) { return !dir && ends(n, ".json"); });
-  newestFirst(v);
-  return v;
+  return newestFirst(
+      listTimed(catalog::path(SLOOP_DIR), [](const std::string& n, bool dir) { return !dir && ends(n, ".json"); }));
 }
 
 std::vector<std::string> sloop::songs() {
-  auto v = listDir(catalog::path(SLOOP_SONGS_DIR), [](const std::string& n, bool dir) {
+  return newestFirst(listTimed(catalog::path(SLOOP_SONGS_DIR), [](const std::string& n, bool dir) {
     return !dir && (ends(n, ".sloopsong") || ends(n, ".json"));
-  });
-  newestFirst(v);
-  return v;
+  }));
 }
 
 std::vector<std::string> sloop::sampleSources() {
@@ -378,9 +384,18 @@ static std::string jsonString(const std::string& s) {
   return out;
 }
 
-// a new file in where: prefix-N.ext (its name into saved), head (the fields before "objects", each followed by ", "),
+// the stem that no file of where has: stem, then stem-2, then stem-3
+static std::string freeStem(const std::string& dir, const std::string& stem, const char* ext) {
+  std::vector<std::string> taken;
+  for (const savename::Timed& t : listTimed(dir, [](const std::string&, bool) { return true; })) {
+    taken.push_back(t.name);
+  }
+  return savename::freeName(stem, ext, taken);
+}
+
+// a new file in where: stem.ext, or stem-2.ext ... when the name is taken (its name into saved), head (the fields before "objects", each followed by ", "),
 // then the objects. Written out by hand: the data is big, and ArduinoJson would hold all of it twice
-static bool writeFile(const char* where, const char* prefix, const char* ext, const std::string& head,
+static bool writeFile(const char* where, const std::string& stem, const char* ext, const std::string& head,
                       const std::vector<sloop::Object>& objects, std::string& saved) {
   std::string dir = catalog::path(where);
   if (dir.empty()) {
@@ -388,12 +403,7 @@ static bool writeFile(const char* where, const char* prefix, const char* ext, co
   }
   mkdir(catalog::path(SLOOP_DIR).c_str(), 0777);
   mkdir(dir.c_str(), 0777);
-  struct stat st;
-  int n = 1;
-  while (n < 10000 && !stat((dir + "/" + prefix + "-" + std::to_string(n) + ext).c_str(), &st)) {
-    n++;
-  }
-  saved = std::string(prefix) + "-" + std::to_string(n) + ext;
+  saved = freeStem(dir, stem, ext) + ext;
   FILE* f = fopen((dir + "/" + saved).c_str(), "wb");
   if (!f) {
     return false;
@@ -481,7 +491,7 @@ static const char* get(int d, const Item& it, sloop::Object& o, uint32_t& done, 
 }
 
 // --------------------------------------------------------------------------------------------- backup ---
-const char* sloop::backup(int d, const Info& info, std::string& saved, Progress p, const char* prefix) {
+const char* sloop::backup(int d, const Info& info, std::string& saved, Progress p, const std::string& stem) {
   if (info.proto < 6) {
     return "Backups need SLOOP 2.3 or later.";
   }
@@ -505,7 +515,7 @@ const char* sloop::backup(int d, const Info& info, std::string& saved, Progress 
   }
   std::string head = "\"format\": \"sloop-backup\", \"version\": 1, \"firmware\": " + jsonString(b.firmware) +
                      ", \"date\": " + jsonString(b.date) + ", ";
-  if (!writeFile(SLOOP_DIR, prefix, ".json", head, b.objects, saved)) {
+  if (!writeFile(SLOOP_DIR, stem, ".json", head, b.objects, saved)) {
     return "Can't write it to the SD card.";
   }
   hal::log("sloop: %s: %u objects, %u bytes", saved.c_str(), (unsigned)b.objects.size(), (unsigned)total);
@@ -627,7 +637,8 @@ static const char* newer(const sloop::Backup& b, const sloop::Info& info) {
   return 0;
 }
 
-const char* sloop::restore(int d, const std::string& name, std::string& savedFirst, Progress p) {
+const char* sloop::restore(int d, const std::string& name, std::string& savedFirst, Progress p,
+                           const std::string& beforeStem) {
   Backup b;
   std::string why;
   if (!read(name, b, why)) {
@@ -654,7 +665,7 @@ const char* sloop::restore(int d, const std::string& name, std::string& savedFir
     }
   }
   // what it has now, first: to go back to
-  if (const char* e = backup(d, info, savedFirst, 0, "before-restore")) {
+  if (const char* e = backup(d, info, savedFirst, 0, beforeStem)) {
     return e;
   }
   uint32_t total = 0, done = 0;
@@ -708,18 +719,7 @@ const char* sloop::loadProject(int d, const std::string& name, int from, int to,
 }
 
 // ------------------------------------------------------------------------------------------------ songs ---
-// the number the next prefix-N.ext in where gets
-static int nextNumber(const char* where, const char* prefix, const char* ext) {
-  std::string dir = catalog::path(where);
-  struct stat st;
-  int n = 1;
-  while (n < 10000 && !dir.empty() && !stat((dir + "/" + prefix + "-" + std::to_string(n) + ext).c_str(), &st)) {
-    n++;
-  }
-  return n;
-}
-
-const char* sloop::saveSong(int d, const Info& info, std::string& saved, Progress p, const char* prefix) {
+const char* sloop::saveSong(int d, const Info& info, std::string& saved, Progress p, const std::string& stem) {
   if (info.proto < 6) {
     return "Songs need SLOOP 2.3 or later.";
   }
@@ -753,23 +753,20 @@ const char* sloop::saveSong(int d, const Info& info, std::string& saved, Progres
   if (!s.get(0)) {
     return "The FM-1 has no loop to save.";
   }
-  // its name, as SLOOP's editor shows it ("SONG 3", "BEFORE SONG 2"): the file's
-  std::string name;
-  for (const char* c = prefix; *c; c++) {
-    name += *c == '-' ? ' ' : (char)toupper((unsigned char)*c);
-  }
-  name += " " + std::to_string(nextNumber(SLOOP_SONGS_DIR, prefix, ".sloopsong"));
+  // its name, as SLOOP's editor shows it: the stem of the file, as it saves
+  std::string name = freeStem(catalog::path(SLOOP_SONGS_DIR), stem, ".sloopsong");
   std::string head = "\"format\": \"sloop-song\", \"version\": 1, \"name\": " + jsonString(name) +
                      ", \"firmware\": " + jsonString(info.version) + ", \"date\": " + jsonString(isoNow()) + ", \"order\": " +
                      (order.empty() ? std::string("null") : "\"" + base64(order.data(), order.size()) + "\"") + ", ";
-  if (!writeFile(SLOOP_SONGS_DIR, prefix, ".sloopsong", head, s.objects, saved)) {
+  if (!writeFile(SLOOP_SONGS_DIR, stem, ".sloopsong", head, s.objects, saved)) {
     return "Can't write it to the SD card.";
   }
   hal::log("sloop: %s: %u objects, %u bytes", saved.c_str(), (unsigned)s.objects.size(), (unsigned)total);
   return 0;
 }
 
-const char* sloop::loadSong(int d, const std::string& name, std::string& savedFirst, Progress p) {
+const char* sloop::loadSong(int d, const std::string& name, std::string& savedFirst, Progress p,
+                            const std::string& beforeStem) {
   Song s;
   std::string why;
   static std::string w;
@@ -788,7 +785,7 @@ const char* sloop::loadSong(int d, const std::string& name, std::string& savedFi
     return e;
   }
   // the song it has, first: to go back to
-  if (const char* e = saveSong(d, info, savedFirst, 0, "before-song")) {
+  if (const char* e = saveSong(d, info, savedFirst, 0, beforeStem)) {
     return e;
   }
   static const std::vector<uint8_t> none;
