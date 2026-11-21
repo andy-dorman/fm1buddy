@@ -16,6 +16,8 @@ void kittenMode(bool on);  // Kitten Synths: SLOOP that says only "FELUCCA 2.8-K
 void feluccaMode(bool on);
 // or an SMK-37 Elite (the FM-1's chip in a keyboard) on its stock firmware
 void smkMode(bool on);
+// or the fm1-sampler firmware ("FM1 Community", 3654:7756, FM-1_8000014); a good install of another package ends it
+void samplerMode(bool on);
 void lostCalMode(bool on);    // its SMK-37 calibration sector blank (--lostcal)
 void bigscreenMode(bool on);  // its firmware has Big Screen: it sends its screen while asked (--bigscreen)
 // the keyboard sends MIDI clock too, at 100 BPM (to follow)

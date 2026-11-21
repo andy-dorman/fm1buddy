@@ -16,6 +16,7 @@ struct Fm1Id {
   char text[28];
   char model[24];  // "FM-1", "ota-FM-1", "SMK-37 Elite"
   uint32_t version;
+  char build[65];  // the build ID, 64 lower-case hex characters ("": the firmware gave none)
   bool ota() const;
 };
 

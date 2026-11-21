@@ -52,6 +52,7 @@ static struct {
   bool felucca;    // ... or plain Felucca (the same, but 3 sample slots, no backups)
   bool kitten;     // ... or Kitten Synths (SLOOP, saying only "FELUCCA 2.8-KITTEN BETA")
   bool lostCal;    // its flash's SMK-37 calibration sector is blank (an SMK-37 that lost it: it looks like an FM-1)
+  bool sampler;    // it runs the fm1-sampler firmware (its own name and IDs, until a good install)
   bool smk;        // it's an SMK-37 Elite on its stock firmware (the FM-1's chip and update, its own name)
   bool bigscreen;  // its firmware has Big Screen: it sends its screen while asked (mirror.h)
   std::vector<uint8_t> song, kits, in;
@@ -129,6 +130,15 @@ static void identity() {
   uint8_t d[34] = {0x00, 0x59, 0x11};
   strncpy((char*)d + 6, f.ident.c_str(), 27);
   framed(d, sizeof d);
+}
+
+// the fm1-sampler's answer to command 49: 47 bytes, the mark FMC1, and its build ID (bytes 14 to 45: 0xA0, 0xA1, ...)
+static void buildId() {
+  uint8_t reply[47] = {'F', 'M', 'C', '1'}, wire[96];
+  for (int i = 14; i < 46; i++) {
+    reply[i] = (uint8_t)(0xA0 + i - 14);
+  }
+  sendSysex(FM1, wire, fm1::frame(49, reply, sizeof reply, wire));
 }
 
 static void ask() {
@@ -596,6 +606,10 @@ void fake::smkMode(bool on) {
   f.smk = on;
 }
 
+void fake::samplerMode(bool on) {
+  f.sampler = on;
+}
+
 // ------------------------------------------------------------------------------- its boot loader ---
 // F0 22 24 35 7D F7 sends it there: then it's a USB storage device (4C4A:8057) answering JieLi's commands (uboot.h),
 // slow to answer at first, until it's told to run its firmware again. Its flash: 1 MiB, made up
@@ -869,7 +883,11 @@ static void fromHost(const uint8_t* b, uint32_t n) {
   static const uint8_t KEY[] = {0xF0, 0x22, 0x24, 0x35, 0x7D, 0xF7};
   static const uint8_t UPGRADE[] = {0xF0, 0x22, 0x24, 0x35, 0x7F, 0xF7};
   uint8_t req[16];
-  if (n == 10 && !memcmp(b, HS, 4)) {  // (cmd 0x51's frames start the same way)
+  if (fm1::unframe(b, n, 49, req, sizeof req) == 0) {  // (it starts like the identity query: first)
+    if (f.state == decltype(f.state)::RUN && f.sampler) {
+      buildId();
+    }
+  } else if (n == 10 && !memcmp(b, HS, 4)) {  // (cmd 0x51's frames start the same way)
     identity();
   } else if (f.state == decltype(f.state)::RUN && f.bigscreen && screenHello(b, n)) {
   } else if (f.state == decltype(f.state)::RUN && n == sizeof KEY && !memcmp(b, KEY, n)) {
@@ -915,6 +933,7 @@ static void fromHost(const uint8_t* b, uint32_t n) {
         if (good) {
           installIntoFlash();
           f.ident = fm1::imageProduct;
+          f.sampler = false;  // the package replaced the fm1-sampler firmware
           ubSave();
         }
         restart(decltype(f.state)::RUN, good ? fm1::imageProduct : "FM-1_bad");
@@ -1114,6 +1133,7 @@ void fake::keysClock(bool on) {
 static void run(bool fm1, int keys) {
   if (fm1) {
     f.ident = f.smk ? "SMK-37 Elite_016" : f.fomajam ? "FM-1_961"
+                                       : f.sampler   ? "FM-1_8000014"
                                                      : "FM-1_015";
     if (!keptIdent.empty() && !f.smk) {
       f.ident = keptIdent;
@@ -1132,8 +1152,10 @@ static void run(bool fm1, int keys) {
     if (f.state == decltype(f.state)::GONE && f.mountAt && (int32_t)(now - f.mountAt) >= 0) {
       f.mountAt = 0;
       f.state = (decltype(f.state))f.next;
-      midi::mount(FM1, 0x1209, 0x0001,
+      bool sampler = f.sampler && f.state == decltype(f.state)::RUN;  // its loader keeps the stock name and IDs
+      midi::mount(FM1, sampler ? 0x3654 : 0x1209, sampler ? 0x7756 : 0x0001,
                   f.state == decltype(f.state)::LOADER ? (f.smk ? "ota-SMK-37 Elite" : "ota-FM-1")
+                  : sampler                            ? "FM1 Community"
                   : f.fomajam || f.sloop               ? "Felucca"
                   : f.smk                              ? "SMK-37 Elite"
                                                        : "FM-1",

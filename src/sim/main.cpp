@@ -1,11 +1,11 @@
 // The app on the desktop: an SDL window twice the screen's size, the mouse for touch.
 //
-//   program [--headless] [--zoom N] [--theme NAME] [--fm1] [--fomajam] [--sloop] [--kitten] [--smk] [--lostcal] [--bigscreen] [--faults] [--keys [N]] [--clock] [--install FILE]
+//   program [--headless] [--zoom N] [--theme NAME] [--fm1] [--fomajam] [--sloop] [--sampler] [--kitten] [--smk] [--lostcal] [--bigscreen] [--faults] [--keys [N]] [--clock] [--install FILE]
 //           [--backup] [--recover FILE] [--restore FILE [--save-first] [--transfer]] [--uid N] [--lowmem] [--watchdog BYTES]
 //           [--script "tap 24 70; wait 300; shot a.bmp; quit"]
 //
 // --fm1 puts a pretend FM-1 on the hub (it goes through a whole install), --fomajam makes it one running fomajam (it
-// shares its song), --sloop one running SLOOP 2.8 (backups, projects, songs, sample slots), --kitten Kitten Synths (SLOOP under another name), --smk makes it an SMK-37 Elite, --lostcal an SMK-37 whose calibration sector is blank (it looks like an FM-1), --bigscreen one whose firmware sends its screen (Manager > Big Screen), --faults makes it and its USB misbehave, --keys adds a keyboard that plays now and then (--keys 2: two of the same, on hub ports B and C) (--clock:
+// shares its song), --sloop one running SLOOP 2.8 (backups, projects, songs, sample slots), --sampler one running fm1-sampler ("FM1 Community", 3654:7756), --kitten Kitten Synths (SLOOP under another name), --smk makes it an SMK-37 Elite, --lostcal an SMK-37 whose calibration sector is blank (it looks like an FM-1), --bigscreen one whose firmware sends its screen (Manager > Big Screen), --faults makes it and its USB misbehave, --keys adds a keyboard that plays now and then (--keys 2: two of the same, on hub ports B and C) (--clock:
 // and sends MIDI clock at 100 BPM).
 // --install FILE installs /fm1/FILE on the pretend FM-1, again (as a person would) if it doesn't finish, up to 3
 // times, then quits: 0 if it's installed, 1 if not.
@@ -181,6 +181,9 @@ int main(int argc, char** argv) {
     } else if (!strcmp(argv[i], "--sloop")) {
       fm1 = true;
       fake::sloopMode(true);
+    } else if (!strcmp(argv[i], "--sampler")) {
+      fm1 = true;
+      fake::samplerMode(true);
     } else if (!strcmp(argv[i], "--smk")) {
       fm1 = true;
       fake::smkMode(true);

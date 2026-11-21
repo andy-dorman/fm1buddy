@@ -895,6 +895,9 @@ static void installJob(void*) {
     error = "The file on the SD card isn't what the Hub says it is (sha256): download it again.";
     return finish(false);
   }
+  // the build ID of the firmware now on the FM-1, before the data save takes it into its boot loader
+  const Fm1Id* before = fm1::known(fm1::current());
+  const std::string fromBuild = before ? before->build : "";
   if (installDataSave && !dataSaveBefore()) {
     return finish(false);
   }
@@ -905,6 +908,9 @@ static void installJob(void*) {
     fprintf(rec, "file     %s\n", target.file.c_str());
     fprintf(rec, "size     %u (image %u)\n", (unsigned)pkg.fileSize, (unsigned)pkg.size);
     fprintf(rec, "product  %s\n", pkg.product);
+    if (!fromBuild.empty()) {
+      fprintf(rec, "from build %s\n", fromBuild.c_str());
+    }
     fprintf(rec, "sha256   %s\n", pkg.sha256);
     fprintf(rec, "known    %s\n\n",
             target.sha256.empty() ? "no (not on the Hub, nor one of M-VAVE's): not checked" : "yes: its sha256 checked");
@@ -1299,11 +1305,12 @@ static bool readFlash(int d, bool smkScreen, const char* title, const char* what
 
 // a flash as dir/fm1-N-FW.bin (its name into saved), and what it was (fm1-N-FW.txt). FW: the firmware it ran
 // ("FM-1_904"), when that's known. N comes first (the lists sort by it). head: the first line of the .txt ("" says it's
-// a backup). last: the file of the install before, when there is one. With alive: the loader is still running, and
+// a backup). last: the file of the install before, when there is one. build: the build ID of the firmware ("" writes no
+// line). With alive: the loader is still running, and
 // kept so (the card can take longer than it waits)
 static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::string& was, bool alive,
                        const std::string& fw = "", const char* folder = BACKUPS_DIR, const std::string& head = "",
-                       const std::string& last = "") {
+                       const std::string& last = "", const std::string& build = "") {
   mkdir(catalog::path(BACKUPS_DIR).c_str(), 0777);
   std::string dir = catalog::path(folder);
   mkdir(dir.c_str(), 0777);
@@ -1349,6 +1356,9 @@ static bool saveBackup(const FlashBuf& a, const uboot::Chip& chip, const std::st
                       (unsigned)chip.size, part ? ", " : "", part ? part : "", uboot::uidText(chip).c_str(), sha) > 0;
     if (ok && !last.empty()) {
       ok = fprintf(f, "install  %s\n", last.c_str()) > 0;
+    }
+    if (ok && !build.empty()) {
+      ok = fprintf(f, "build    %s\n", build.c_str()) > 0;
     }
     ok &= f && !fclose(f);
   }
@@ -1537,7 +1547,7 @@ static bool dataSaveBefore() {
     step = SAVING;
     std::string kept = saved;
     std::string head = "fm1buddy data save: all of the FM-1's flash, before an install, through its boot loader";
-    bool good = saveBackup(a, chip, id.text, false, id.text, DATA_SAVES_DIR, head, lastInstall());
+    bool good = saveBackup(a, chip, id.text, false, id.text, DATA_SAVES_DIR, head, lastInstall(), id.build);
     std::string own = saved;
     saved = kept;
     if (!good) {
@@ -1988,6 +1998,7 @@ static void restoreDataJob(void*) {
   uboot::Chip chip;
   const Fm1Id* known = fm1::known(device);
   const std::string current = known ? known->text : "";  // (known is lost when the FM-1 leaves its firmware)
+  const std::string currentBuild = known ? known->build : "";
   step = BOOT_LOADER;
   hal::bleHold(true);
   e = uboot::enter(device, chip);
@@ -2056,7 +2067,7 @@ static void restoreDataJob(void*) {
     fmShow("SAVING", 30, true);
     std::string head = std::string("fm1buddy data save: all of the FM-1's flash, before a ") +
                        (restoreTransfer ? "transfer" : "restore") + ", through its boot loader";
-    if (!saveBackup(now, chip, current, true, current, DATA_SAVES_DIR, head, lastInstall())) {
+    if (!saveBackup(now, chip, current, true, current, DATA_SAVES_DIR, head, lastInstall(), currentBuild)) {
       e = "Can't make a data save of the current data: nothing was written.";
       refused = true;
     }

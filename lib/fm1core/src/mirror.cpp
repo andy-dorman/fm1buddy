@@ -1,9 +1,7 @@
 #include "mirror.h"
 
-#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 
 #include <atomic>
 #include <mutex>
@@ -71,22 +69,9 @@ bool mirror::live() {
   return seen;
 }
 
-// who may be an FM-1: those fm1.h asks, and the Big Screen firmware on M-VAVE's Open V14 ("FM1 Community")
+// who may be an FM-1: those fm1.h asks (this includes the Big Screen firmware on M-VAVE's Open V14, "FM1 Community")
 static bool fm1Like(int d) {
-  midi::Dev v;
-  if (!midi::dev(d, v)) {
-    return false;
-  }
-  if (fm1::candidate(d)) {
-    return true;
-  }
-  char lower[sizeof v.name];
-  uint32_t i = 0;
-  for (; v.name[i]; i++) {
-    lower[i] = tolower(v.name[i]);
-  }
-  lower[i] = 0;
-  return strstr(lower, "fm1");
+  return fm1::candidate(d);
 }
 
 void mirror::service() {

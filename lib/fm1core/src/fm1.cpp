@@ -14,12 +14,14 @@
 #include <vector>
 
 #include "hal.h"
+#include "identify.h"
 #include "memory.h"
 #include "midi.h"
 
 static const uint8_t HS_QUERY[] = {0xF0, 0x00, 0x32, 0x45, 0x00, 0x00, 0x00, 0x40, 0x7F, 0xF7};
 static const uint8_t UPGRADE[] = {0xF0, 0x22, 0x24, 0x35, 0x7F, 0xF7};
 #define MAXDATA 512
+#define BUILD_CMD 49  // asks a firmware for its build ID
 #define FINISH_VERIFY 0xE0000000u
 #define FINISH_WRITE 0xF0000000u
 
@@ -580,19 +582,7 @@ static void wait(uint32_t ms) {
 
 // the device can be an FM-1 (or an SMK-37): by its USB name (never probe other gear)
 static bool candidateDev(const midi::Dev& v) {
-  static const char* NAMES[] = {"fm-1", "felucca", "ota", "composite", "sinco", "usb-midi", "smk-37", "mke-p37", "starrykey"};
-  char lower[sizeof v.name];
-  uint32_t i = 0;
-  for (; v.name[i]; i++) {
-    lower[i] = tolower(v.name[i]);
-  }
-  lower[i] = 0;
-  for (const char* n : NAMES) {
-    if (strstr(lower, n)) {
-      return true;
-    }
-  }
-  return v.vid == 0x1209;  // Felucca, its loader, and the firmwares built on it (each has its own PID)
+  return identify::mayBeFm1(v.name, v.vid);
 }
 
 static bool handshake(int d, Fm1Id& id, int tries = 2) {
@@ -640,14 +630,46 @@ static int waitFor(bool ota, Fm1Id& id, uint32_t ms) {
 }
 
 // what each device said, asked once it settled (not blocking: fm1::watch). One that looks like an FM-1 is asked again
-// every 5 s for a minute: an FM-1 just out of its boot loader (a backup) can be slow to answer
-static struct {
-  uint32_t serial;  // the mount it's about (0: none)
-  uint32_t askAt, sentAt;
+// every 5 s for a minute: an FM-1 just out of its boot loader (a backup) can be slow to answer. Once it said who it is,
+// its firmware is asked for its build ID one time (command 49), and waits 1.5 s for the answer
+static struct Seen {
+  uint32_t serial;         // the mount it's about (0: none)
+  uint32_t askAt, sentAt;  // (after the identity, sentAt is when the build ID was asked)
   uint8_t tries;
+  uint8_t build;  // the build ID: 0 not asked, 1 asked, 2 over (it came, or 1.5 s went by)
   bool done, ok;
   Fm1Id id;
 } ids[MIDI_DEVS];
+
+// the build ID of a firmware that said who it is. The update loader has none, and a firmware that does not know command
+// 49 gives no answer: it gets no build ID
+static void askBuild(int d, Seen& s, uint32_t now, uint8_t* pkt) {
+  if (s.id.ota()) {
+    s.build = 2;
+  } else if (!s.build) {
+    uint8_t query[16];
+    uint32_t len = fm1::frame(BUILD_CMD, 0, 0, query);
+    midi::drain(d);
+    midi::send(d, query, len);
+    s.sentAt = now;
+    s.build = 1;
+  } else {
+    if (uint32_t n = midi::sysex(d, pkt)) {
+      uint8_t payload[64];
+      int k = fm1::unframe(pkt, n, BUILD_CMD, payload, sizeof payload);
+      std::string id = k < 0 ? "" : identify::buildId(payload, k);
+      if (!id.empty()) {
+        memcpy(s.id.build, id.c_str(), id.size() + 1);
+        s.build = 2;
+        hal::log("fm1: %d build %s", d, s.id.build);
+      }
+    }
+    // other SysEx from the FM-1 does not keep the wait open
+    if (s.build == 1 && now - s.sentAt > 1500) {
+      s.build = 2;
+    }
+  }
+}
 
 void fm1::watch() {
   if (busy) {
@@ -668,10 +690,14 @@ void fm1::watch() {
       s.done = !candidateDev(v);
       continue;
     }
+    uint8_t pkt[SYSEX_MAX];
+    if (s.ok && s.build < 2) {
+      askBuild(d, s, now, pkt);
+      continue;
+    }
     if (s.done) {
       continue;
     }
-    uint8_t pkt[SYSEX_MAX];
     if (!s.sentAt) {
       if ((int32_t)(now - s.askAt) >= 0) {
         midi::drain(d);
