@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <new>
 #include <thread>
 
 #include "datasave.h"
@@ -594,32 +595,80 @@ static void recordRewritten() {
   }
 }
 
-// the plan for /fm1 as it is now, from the Hub's list and the sync record, into SYNC_PLAN: false if the list doesn't read
-static bool makePlan() {
-  FwList none, sd;  // (none: the Hub's list stays on the card)
-  catalog::scanSdInto(none, sd);
-  std::vector<std::string> paths;
-  std::vector<syncplan::SdFile> files;
-  paths.reserve(sd.items.size());  // (each in one block: the RAM is small)
-  files.reserve(sd.size());
-  for (const FwItem& it : sd.items) {
-    paths.push_back(std::string(FW_DIR "/") + sd.str(it.file));
+#define SYNC_SPACE_MARGIN (1024 * 1024)  // [bytes] free on the SD card after a download
+#define TOO_MANY_FIRMWARES "Too many firmwares to sync."
+
+// the files of one scan of /fm1 for the sync plan, a package at a time from the scan's list on the card
+struct ScanFiles {
+  const catalog::SdScan* scan;
+  FILE* list;
+  size_t at;
+  bool failed;       // a package didn't read: the plan has not seen all of /fm1
+  FwList one;        // the package that was read last
+  char path[300];    // its whole path (the strings of a file live until the next call)
+};
+
+static void scanRewind(void* arg) {
+  static_cast<ScanFiles*>(arg)->at = 0;
+}
+
+static bool scanNext(void* arg, syncplan::SdFile& file) {
+  ScanFiles& s = *static_cast<ScanFiles*>(arg);
+  if (s.at >= catalog::sdShown(s.scan)) {
+    return false;
   }
-  for (size_t i = 0; i < sd.size(); i++) {
-    files.push_back({paths[i].c_str(), sd.str(sd[i].product), sd.str(sd[i].sha256), sd[i].size});
+  if (!catalog::sdAt(s.list, s.at, s.one, s.scan) || s.one.size() != 1) {
+    s.failed = true;
+    return false;
   }
+  s.at++;
+  const FwItem& it = s.one[0];
+  int len = snprintf(s.path, sizeof s.path, FW_DIR "/%s", s.one.str(it.file));
+  if (len < 0 || len >= (int)sizeof s.path) {
+    s.failed = true;
+    return false;
+  }
+  file = {s.path, s.one.str(it.product), s.one.str(it.sha256), it.size};
+  return true;
+}
+
+// the plan for /fm1 as it is now, from the Hub's list and the sync record, into SYNC_PLAN. The scan of /fm1 is made
+// here, and no one installs it
+static syncplan::PlanResult makePlan() {
+  catalog::SdScan scan = catalog::readSd();
+  ScanFiles* s = new (std::nothrow) ScanFiles();
+  if (!s || !catalog::sdComplete(&scan)) {
+    delete s;
+    catalog::dropSd(scan);
+    return syncplan::PLAN_INCOMPLETE_SCAN;
+  }
+  s->scan = &scan;
+  s->at = 0;
+  s->failed = false;
   FILE* list = fopen(catalog::path(HUB_LIST).c_str(), "r");
   FILE* rec = fopen(catalog::path(SYNC_RECORD).c_str(), "r");
   FILE* out = fopen(catalog::path(SYNC_PLAN).c_str(), "w");
+  bool opened = catalog::openSd(s->list, &scan);
   hal::logRam("before the plan");
-  bool good = list && out && syncplan::plan(list, rec, files.data(), files.size(), out);
+  syncplan::PlanResult result = syncplan::PLAN_NO_HUB_LIST;
+  if (!opened) {
+    result = syncplan::PLAN_INCOMPLETE_SCAN;
+  } else if (list && out) {
+    syncplan::SdSource source = {s, scanRewind, scanNext};
+    result = syncplan::plan(list, rec, source, true, out);
+    if (s->failed) {
+      result = syncplan::PLAN_INCOMPLETE_SCAN;
+    }
+  }
   hal::logRam("after the plan");
-  for (FILE* f : {list, rec, out}) {
+  for (FILE* f : {list, rec, out, s->list}) {
     if (f) {
       fclose(f);
     }
   }
-  return good;
+  delete s;
+  catalog::dropSd(scan);
+  return result;
 }
 
 // one download or replace of the plan: a line of fields (n of them). The failed ones are counted and logged
@@ -774,7 +823,12 @@ static bool syncHub() {
     return true;
   }
   step = READING;
-  if (!makePlan()) {
+  syncplan::PlanResult made = makePlan();
+  if (made == syncplan::PLAN_INCOMPLETE_SCAN) {
+    error = TOO_MANY_FIRMWARES;
+    return false;
+  }
+  if (made != syncplan::PLAN_WRITTEN) {
     error = "The Hub's list on the SD card didn't read.";
     return false;
   }
@@ -789,6 +843,11 @@ static bool syncHub() {
   }
   rewind(plan);
   bool good = true;
+  uint64_t cardTotal = 0, cardUsed = 0;
+  bool checkSpace = hal::sdSpace(cardTotal, cardUsed) && cardTotal > 0;
+  if (!checkSpace) {
+    hal::log("sync: the free space of the SD card isn't known: no check");
+  }
   step = FETCHING;
   done = total = 0;  // (the bytes of each file, from here)
   while (!stopSync && syncplan::readLine(plan, line)) {
@@ -815,6 +874,18 @@ static bool syncHub() {
         good = false;
         break;
       }
+      if (checkSpace && !(hal::sdSpace(cardTotal, cardUsed) && cardTotal > 0)) {
+        checkSpace = false;  // (a read that fails, or a total of 0, is not a full card: no check for the rest)
+        hal::log("sync: the free space of the SD card isn't known: no check");
+      }
+      if (checkSpace) {
+        uint64_t freeBytes = cardTotal > cardUsed ? cardTotal - cardUsed : 0;
+        if ((uint64_t)strtoul(v[4], 0, 10) + SYNC_SPACE_MARGIN > freeBytes) {
+          error = "The SD card is full.";
+          good = false;
+          break;
+        }
+      }
       syncGet(v, n);
     }
   }
@@ -825,6 +896,16 @@ static bool syncHub() {
 static void syncJob(void*) {
   if (!fetchReady()) {
     return finish(false);
+  }
+  {
+    // (a library the scan can't see whole would lose files: stop before anything is written)
+    catalog::SdScan early = catalog::readSd();
+    bool whole = catalog::sdComplete(&early);
+    catalog::dropSd(early);
+    if (!whole) {
+      error = TOO_MANY_FIRMWARES;
+      return finish(false);
+    }
   }
   syncAt = syncOf = 0;
   step = FETCHING;
@@ -1894,31 +1975,38 @@ static bool restoreTransfer;     // DATA_RESTORE: the data save may be from anot
 // transfer), the data save and the flash decide the path, and file gets the name of the package in /fm1
 static uint32_t matchingImageEnd(const datasave::Reader* flash = 0, datasave::TransferPath* path = 0,
                                  std::string* file = 0) {
-  for (size_t i = 0; i < catalog::sd.size(); i++) {
-    if (strncmp(catalog::sd.str(catalog::sd[i].product), "FM-1_", 5)) {
+  FILE* list = 0;
+  if (!catalog::openSd(list)) {
+    return 0;
+  }
+  uint32_t end = 0;
+  FwList one;
+  for (size_t i = 0, count = catalog::sdShown(); !end && i < count; i++) {
+    if (!catalog::sdAt(list, i, one) || strncmp(one.str(one[0].product), "FM-1_", 5)) {
       continue;
     }
     Pkg pkg;  // (one at a time: a board with no PSRAM has no room for two)
     uint32_t at = 0, n = 0;
-    if (pkg.open(catalog::path(std::string(FW_DIR "/") + catalog::sd.str(catalog::sd[i].file)).c_str()) ||
-        !pkg.flash(at, n)) {
+    if (pkg.open(catalog::path(std::string(FW_DIR "/") + one.str(one[0].file)).c_str()) || !pkg.flash(at, n)) {
       continue;
     }
-    datasave::Package one{[&pkg, at](uint32_t a, uint8_t* out, uint32_t len) { return pkg.read(at + a, out, len); }, n};
+    datasave::Package package{[&pkg, at](uint32_t a, uint8_t* out, uint32_t len) { return pkg.read(at + a, out, len); }, n};
     if (flash) {
-      datasave::Transfer t = datasave::transfer(binRead, *flash, {one});
+      datasave::Transfer t = datasave::transfer(binRead, *flash, {package});
       if (t.path == datasave::TRANSFER_NO_PACKAGE) {
         continue;
       }
       *path = t.path;
-      *file = catalog::sd.str(catalog::sd[i].file);
-      return n;
-    }
-    if (datasave::matchPackage(binRead, {one}) == 0) {
-      return n;
+      *file = one.str(one[0].file);
+      end = n;
+    } else if (datasave::matchPackage(binRead, {package}) == 0) {
+      end = n;
     }
   }
-  return 0;
+  if (list) {
+    fclose(list);
+  }
+  return end;
 }
 
 // A transfer to an FM-1 that runs another build: out of the boot loader, the package installed (no data save: the

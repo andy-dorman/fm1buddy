@@ -12,7 +12,8 @@
 // --backup backs up the pretend FM-1's flash, --restore FILE (a .bin in /backups/switch) puts a data save's data
 // sectors back on it (--save-first: a data save of the current data first; --transfer: the data save may be from another FM-1, and the matching package is installed first if the FM-1 runs another build; --uid N: the pretend FM-1 has another unique ID, flash head, and key_mac sector), --recover FILE (/fm1/X.fwsc or /backups/X.bin) recovers it (recovery mode, the key, the writes),
 // then quit: 0 if it went, 1 if not. Each logs its flash's sha256 after ("sim: flash").
-// --lowmem keeps big things on the SD card (memory.h lowMemory), as a board without PSRAM does (cardbuddy's)
+// --lowmem keeps big things on the SD card (memory.h lowMemory), as a board without PSRAM does (cardbuddy's), the SD
+// list (catalog::keepSd) too
 // --watchdog BYTES models the board's task watchdog: a job that reads and writes more than BYTES of the SD card with no
 // wait ends the program with exit code 3, as the board restarts (watchdog.cpp)
 //
@@ -171,6 +172,7 @@ int main(int argc, char** argv) {
       fake::keepFlash(argv[++i]);
     } else if (!strcmp(argv[i], "--lowmem")) {
       lowMemory = true;
+      catalog::keepSd = false;
     } else if (!strcmp(argv[i], "--watchdog") && i + 1 < argc) {
       watchdog::enable(strtoull(argv[++i], 0, 10));
     } else if (!strcmp(argv[i], "--install") && i + 1 < argc) {
@@ -375,10 +377,9 @@ int main(int argc, char** argv) {
     }
     if (run && !install.empty() && ended && tries < 3 && (int32_t)(hal::millis() - installAt) >= 0) {
       Firmware f;
-      for (size_t i = 0; i < catalog::sd.size(); i++) {
-        if (install == catalog::sd.str(catalog::sd[i].file)) {
-          f = catalog::details(catalog::sd, i);
-        }
+      FwList one;
+      if (int at = catalog::sdFind(install.c_str()); at >= 0 && catalog::sdAt(at, one)) {
+        f = catalog::details(one, 0);
       }
       f.file = install;
       f.onSd = true;

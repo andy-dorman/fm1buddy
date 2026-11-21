@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <new>
 
 #include "fm1.h"
 #include "hal.h"
@@ -216,6 +217,7 @@ using syncplan::readLine;
 using syncplan::split;
 
 bool catalog::keepHub = true;
+bool catalog::keepSd = true;
 
 // HUB_LIST open, past its first line (when it was made, into when): 0 if it isn't there, or isn't one
 static FILE* openList(std::string& when, uint32_t& at) {
@@ -596,10 +598,22 @@ Firmware catalog::details(const FwList& l, size_t i) {
   f.forFm1 = it.flags & FwItem::FOR_FM1;
   f.forSmk37 = it.flags & FwItem::FOR_SMK37;
   if (&l == &hub && f.onSd) {  // the copy on the SD card: where it is in /fm1 (a folder, say)
-    for (const FwItem& x : sd.items) {
-      if ((x.flags & FwItem::FROM_HUB && x.line == it.line) || (*l.str(it.sha256) && !strcasecmp(sd.str(x.sha256), l.str(it.sha256)))) {
-        f.file = sd.str(x.file);
-        break;
+    FILE* list = 0;
+    FwList one;
+    if (openSd(list)) {
+      for (size_t i = 0, n = sdShown(); i < n; i++) {
+        if (!sdAt(list, i, one)) {
+          continue;
+        }
+        const FwItem& x = one[0];
+        if ((x.flags & FwItem::FROM_HUB && x.line == it.line) ||
+            (*l.str(it.sha256) && !strcasecmp(one.str(x.sha256), l.str(it.sha256)))) {
+          f.file = one.str(x.file);
+          break;
+        }
+      }
+      if (list) {
+        fclose(list);
       }
     }
   }
@@ -634,26 +648,12 @@ Firmware catalog::details(const FwList& l, size_t i) {
 
 // ------------------------------------------------------------------------------------- the SD card ---
 // what's known of each file, kept on the card by its name, size and time (so each is read once): lines
-// "name size mtime sha256 product" ("-": not a package). In memory as one block of text (in the PSRAM once it's big),
-// with a '\n' before each line
+// "name size mtime sha256 product" ("-": not a package). Not in memory: an index of it is (CacheIndex, below), and a
+// new line goes to the end of the file as soon as it's known. With two lines of one key, the last one is the line
 #define SHA_CACHE DATA_DIR "/sd-sha256.txt"
 
-// the ones read since power-on, too (so a card that can't be written isn't read again and again)
-static std::mutex knownMu;
-static std::string known;
-
-static void readCache(std::string& cache) {
-  cache = "\n";
-  std::string file;
-  if (readAll(catalog::path(SHA_CACHE), file)) {
-    cache += file;
-  }
-  if (cache.back() != '\n') {
-    cache += '\n';
-  }
-  std::lock_guard<std::mutex> l(knownMu);
-  cache += known;
-}
+// one lock for the cache file: a scan holds it while it reads the cache, a write of the whole cache holds it
+static std::mutex cacheMu;
 
 static std::string cacheKey(const char* name, uint32_t size, uint32_t mtime) {
   char key[300];
@@ -661,42 +661,8 @@ static std::string cacheKey(const char* name, uint32_t size, uint32_t mtime) {
   return key;
 }
 
-// a file's line: its sha256 ("" if it isn't known yet) and product (false: not known yet; older lines have none)
-static bool cached(const std::string& key, const std::string& cache, std::string& sha, std::string& product) {
-  sha.clear();
-  for (size_t at = 0; (at = cache.find(key, at)) != std::string::npos; at++) {
-    size_t s = at + key.size(), end = cache.find('\n', s);
-    if (cache[at - 1] != '\n' || end == std::string::npos || end < s + 64) {
-      continue;
-    }
-    sha = cache.substr(s, 64);
-    if (end == s + 64 || cache[s + 64] != ' ') {
-      return false;
-    }
-    product = cache.substr(s + 65, end - s - 65);
-    product = product == "-" ? "" : product;
-    return true;
-  }
-  return false;
-}
-
 static std::string cacheLine(const std::string& key, const std::string& sha, const std::string& product) {
   return key + sha + " " + (product.empty() ? "-" : product) + "\n";
-}
-
-static bool writeCache(const std::string& lines) {
-  mkdir(catalog::path(DATA_DIR).c_str(), 0777);
-  FILE* c = fopen(catalog::path(SHA_CACHE).c_str(), "w");
-  if (!c) {
-    hal::log("sd: can't write %s (errno %d)", SHA_CACHE, errno);
-    return false;
-  }
-  bool ok = fwrite(lines.data(), 1, lines.size(), c) == lines.size() && !ferror(c);
-  if (fclose(c) || !ok) {
-    hal::log("sd: writing %s failed (errno %d)", SHA_CACHE, errno);
-    return false;
-  }
-  return true;
 }
 
 static bool isPkg(const char* name) {
@@ -704,159 +670,768 @@ static bool isPkg(const char* name) {
   return name[0] != '.' && n > 5 && !strcasecmp(name + n - 5, ".fwsc");
 }
 
-// the packages in /fm1 and its folders (FOLDER_DEPTH deep): their paths in /fm1 ("zp12.fwsc", "drums/x.fwsc": one
-// block of text, each with its 0), sizes and times. A read of the card can fail (one did, in /fm1, while the internal
-// RAM was short: the listing ended early), so a folder is read again, up to 3 times. whole: false if a last try failed
+// the packages in /fm1 and its folders (FOLDER_DEPTH deep): their paths in /fm1 ("zp12.fwsc", "drums/x.fwsc"), sizes and
+// times. A read of the card can fail (one did, in /fm1, while the internal RAM was short: the listing ended early), so a
+// folder is read again, up to 3 times. whole: false if a last try failed
 #define FOLDER_DEPTH 4
 #define FOLDERS_MAX 200
-struct SdFile {
-  uint32_t name, size, mtime;
-};
-struct SdFiles {
-  std::vector<SdFile> list;
-  std::string names;
-};
-struct Listing {
-  SdFiles* out;
-  std::vector<std::string>* folders;  // still to read
-  const std::string* at;              // the folder being read ("": /fm1)
-  int depth;
-};
-
-static bool listPkgs(const std::string& dir, SdFiles& out) {
-  out.list.clear();
-  if (!lowMemory) {
-    out.list.reserve(512);  // (in the PSRAM)
-  }
-  out.names.clear();
-  std::vector<std::string> folders{""};
-  bool whole = true;
-  for (size_t f = 0; f < folders.size(); f++) {
-    const std::string at = folders[f];
-    const size_t n = out.list.size(), c = out.names.size(), k = folders.size();
-    Listing l{&out, &folders, &at, at.empty() ? 1 : 2 + (int)std::count(at.begin(), at.end(), '/')};
-    bool ok = false;
-    for (int tries = 1; !ok && tries <= 3; tries++) {
-      out.list.resize(n), out.names.resize(c), folders.resize(k);  // (what a failed try got)
-      ok = hal::listDir(
-          (at.empty() ? dir : dir + "/" + at).c_str(),
-          [](const char* name, uint32_t size, uint32_t mtime, bool folder, void* arg) {
-            Listing& l = *(Listing*)arg;
-            std::string p = l.at->empty() ? name : *l.at + "/" + name;
-            if (folder) {
-              if (name[0] != '.' && l.depth <= FOLDER_DEPTH && l.folders->size() < FOLDERS_MAX) {
-                l.folders->push_back(p);
-              }
-            } else if (isPkg(name)) {
-              l.out->list.push_back({(uint32_t)l.out->names.size(), size, mtime});
-              l.out->names.append(p.c_str(), p.size() + 1);
-            }
-          },
-          &l);
-      if (!ok) {
-        hal::log("sd: listing %s/%s failed after %u packages, try %d", dir.c_str(), at.c_str(), (unsigned)out.list.size(), tries);
-      }
-    }
-    whole &= ok;
-  }
-  return whole;
-}
 
 static std::atomic<bool> hashing{false}, hashedNew{false};
 
-int catalog::scanSdInto(FwList& hub, FwList& sd) {
+// ------------------------------------------------------------------- the SD list: a scan, and what reads it ---
+// A name on the card of its own for each call (a scan can run while another does, and while a job does)
+static std::atomic<unsigned> tempCount{0};
+
+static std::string tempName(const char* what) {
+  char name[64];
+  snprintf(name, sizeof name, DATA_DIR "/%s-%u.tmp", what, ++tempCount);
+  return name;
+}
+
+// The packages in /fm1 (as listPkgs above), a line "path size mtime" each, into a file on the card: no list in memory.
+// A try of a folder that failed leaves its lines in the file: they are written over with one line that starts with
+// '#', and the next try writes after them. count: how many packages the file holds. whole: false if a last try failed,
+// or a line did not write
+struct Written {
+  FILE* out;
+  uint32_t* count;
+  std::vector<std::string>* folders;
+  const std::string* at;
+  int depth;
+  bool good;
+};
+
+static void blankLines(FILE* f, long from, long to) {
+  if (to - from < 2) {
+    return;
+  }
+  fseek(f, from, SEEK_SET);
+  fputc('#', f);
+  for (long i = from + 2; i < to; i++) {
+    fputc(' ', f);
+  }
+  fputc('\n', f);
+  fseek(f, to, SEEK_SET);
+}
+
+static bool listPkgs(const std::string& dir, const std::string& file, uint32_t& count) {
+  count = 0;
+  FILE* out = fopen(catalog::path(file).c_str(), "wb");
+  if (!out) {
+    hal::log("sd: can't write %s (errno %d)", file.c_str(), errno);
+    return false;
+  }
+  std::vector<std::string> folders{""};
+  bool whole = true, good = true;
+  for (size_t f = 0; f < folders.size(); f++) {
+    const std::string at = folders[f];
+    const size_t k = folders.size();
+    const uint32_t first = count;
+    const long from = ftell(out);
+    Written w{out, &count, &folders, &at, at.empty() ? 1 : 2 + (int)std::count(at.begin(), at.end(), '/'), true};
+    bool ok = false;
+    for (int tries = 1; !ok && tries <= 3; tries++) {
+      if (tries > 1) {
+        blankLines(out, from, ftell(out));  // (what a failed try wrote)
+        count = first, folders.resize(k);
+      }
+      ok = hal::listDir(
+          (at.empty() ? dir : dir + "/" + at).c_str(),
+          [](const char* name, uint32_t size, uint32_t mtime, bool folder, void* arg) {
+            Written& w = *(Written*)arg;
+            std::string p = w.at->empty() ? name : *w.at + "/" + name;
+            if (folder) {
+              if (name[0] != '.' && w.depth <= FOLDER_DEPTH && w.folders->size() < FOLDERS_MAX) {
+                w.folders->push_back(p);
+              }
+            } else if (isPkg(name)) {
+              if (fprintf(w.out, "%s\t%lu\t%lu\n", p.c_str(), (unsigned long)size, (unsigned long)mtime) < 0) {
+                w.good = false;
+              } else {
+                ++*w.count;
+              }
+            }
+          },
+          &w);
+      if (!ok) {
+        hal::log("sd: listing %s/%s failed after %u packages, try %d", dir.c_str(), at.c_str(), (unsigned)count, tries);
+      }
+    }
+    whole &= ok;
+    good &= w.good;
+  }
+  good &= !ferror(out);
+  good &= !fclose(out);
+  return whole && good;
+}
+
+// ---- the cache's index: one entry for each cache line (a hash of its key, and where the line starts), in one block,
+// in the order of the keys. The lookup reads the line from the card. With two lines of one key, the last one is
+// the line of the key
+struct CacheEntry {
+  uint64_t hash;
+  uint32_t at;
+};
+
+static uint64_t hashKey(const char* s, size_t n) {  // (FNV-1a)
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; i++) {
+    h = (h ^ (uint8_t)s[i]) * 1099511628211ull;
+  }
+  return h;
+}
+
+static bool hex(const char* s, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    if (!isxdigit((uint8_t)s[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// where the key of a cache line ends ("name size mtime ": the sha256 is next), 0 if the line is not one of a file
+static size_t keyEnd(const std::string& line) {
+  const char* p = line.c_str();
+  const size_t n = line.size();
+  for (size_t i = 0; i < n; i++) {
+    if (p[i] != ' ') {
+      continue;
+    }
+    size_t j = i + 1, d = j;
+    while (isdigit((uint8_t)p[j])) {
+      j++;
+    }
+    if (j == d || p[j] != ' ') {
+      continue;
+    }
+    size_t e = ++j;
+    d = e;
+    while (isdigit((uint8_t)p[e])) {
+      e++;
+    }
+    if (e == d || p[e] != ' ') {
+      continue;
+    }
+    e++;
+    if (n >= e + 64 && hex(p + e, 64) && (n == e + 64 || p[e + 64] == ' ')) {
+      return e;
+    }
+  }
+  return 0;
+}
+
+struct CacheIndex {
+  CacheEntry* entries = 0;
+  size_t count = 0;
+  FILE* file = 0;       // the cache, open while the index is
+  bool failed = false;  // the cache is there, and there was no room to index it
+  ~CacheIndex() {
+    delete[] entries;
+    if (file) {
+      fclose(file);
+    }
+  }
+};
+
+// the index of the cache file, with the cache's lock held by the caller. With no room for it (or no file), the
+// index holds nothing: each file is one whose sha256 is not known
+static void openCacheIndex(CacheIndex& c) {
+  c.file = fopen(catalog::path(SHA_CACHE).c_str(), "rb");
+  if (!c.file) {
+    return;
+  }
+  std::string line;
+  size_t lines = 0;
+  for (size_t i = 0; readLine(c.file, line); i++) {
+    lines += keyEnd(line) > 0;
+    if (!(i & 15)) {
+      hal::idle();
+    }
+  }
+  c.entries = lines ? new (std::nothrow) CacheEntry[lines] : 0;
+  if (lines && !c.entries) {
+    hal::log("sd: no room for the index of %u cache lines: the cache is not read", (unsigned)lines);
+    c.failed = true;
+    fclose(c.file);
+    c.file = 0;
+    return;
+  }
+  rewind(c.file);
+  uint32_t at = 0;
+  for (size_t i = 0; readLine(c.file, line) && c.count < lines; i++) {
+    uint32_t here = at;
+    at += line.size() + 1;
+    if (size_t e = keyEnd(line)) {
+      c.entries[c.count++] = {hashKey(line.data(), e), here};
+    }
+    if (!(i & 15)) {
+      hal::idle();
+    }
+  }
+  std::sort(c.entries, c.entries + c.count, [](const CacheEntry& a, const CacheEntry& b) {
+    return a.hash != b.hash ? a.hash < b.hash : a.at < b.at;
+  });
+}
+
+// a file's line: its sha256 ("" if it isn't known yet) and product (false: not known yet)
+static bool cacheFind(CacheIndex& c, const std::string& key, std::string& sha, std::string& product) {
+  sha.clear();
+  if (!c.file || !c.count) {
+    return false;
+  }
+  const uint64_t h = hashKey(key.data(), key.size());
+  const CacheEntry* x = std::upper_bound(c.entries, c.entries + c.count, h,
+                                         [](uint64_t h, const CacheEntry& e) { return h < e.hash; });
+  std::string line;
+  while (x > c.entries && (x - 1)->hash == h) {  // (the last line first)
+    --x;
+    if (fseek(c.file, x->at, SEEK_SET) || !readLine(c.file, line) || line.compare(0, key.size(), key) ||
+        line.size() < key.size() + 64) {
+      continue;
+    }
+    sha = line.substr(key.size(), 64);
+    if (line.size() == key.size() + 64 || line[key.size() + 64] != ' ') {
+      return false;
+    }
+    product = line.substr(key.size() + 65);
+    product = product == "-" ? "" : product;
+    return true;
+  }
+  return false;
+}
+
+// ---- a line of the SD list: name author version date path product sha256 size flags kinds line (the Hub's line in
+// HUB_LIST, or NO_LINE), its fields between tabs
+#define SD_FIELDS 11
+#define SD_HEAD "fm1buddy sd 1"
+
+static void writeSdLine(FILE* f, const FwList& one) {
+  const FwItem& it = one[0];
+  for (uint32_t at : {it.name, it.author, it.version, it.date, it.file, it.product, it.sha256}) {
+    field(f, one.str(at));
+  }
+  fprintf(f, "%lu\t%u\t", (unsigned long)it.size, (unsigned)it.flags);
+  std::string kinds;
+  for (size_t k = 0; k < one.kinds.size(); k++) {
+    if (it.kinds & 1u << k) {
+      kinds += (kinds.empty() ? "" : ",") + one.kinds[k];
+    }
+  }
+  field(f, kinds);
+  fprintf(f, "%lu\n", (unsigned long)it.line);
+}
+
+// a line of the SD list (from here in it) onto list: false if it isn't a package's
+static bool addSdLine(std::string& line, FwList& list) {
+  const char* v[SD_FIELDS + 1];
+  if (split(line, v, SD_FIELDS + 1) != SD_FIELDS) {
+    return false;
+  }
+  FwItem it{};
+  it.name = list.add(v[0], strlen(v[0]));
+  it.author = list.add(v[1], strlen(v[1]));
+  it.version = list.add(v[2], strlen(v[2]));
+  it.date = list.add(v[3], strlen(v[3]));
+  it.file = list.add(v[4], strlen(v[4]));
+  it.product = list.add(v[5], strlen(v[5]));
+  it.sha256 = list.add(v[6], strlen(v[6]));
+  it.size = strtoul(v[7], 0, 10);
+  it.flags = (uint8_t)strtoul(v[8], 0, 10);
+  it.line = strtoul(v[10], 0, 10);
+  for (const char* k = v[9]; *k;) {
+    const char* c = strchr(k, ',');
+    size_t n = c ? c - k : strlen(k);
+    it.kinds |= list.kindBit(std::string(k, n));
+    k += n + (c ? 1 : 0);
+  }
+  list.items.push_back(it);
+  return true;
+}
+
+// item i of from into the list of one to
+static void copyItem(const FwList& from, size_t i, FwList& to) {
+  FwItem it = from[i];
+  it.name = to.add(from.str(it.name));
+  it.author = to.add(from.str(it.author));
+  it.version = to.add(from.str(it.version));
+  it.date = to.add(from.str(it.date));
+  it.file = to.add(from.str(it.file));
+  it.product = to.add(from.str(it.product));
+  it.sha256 = to.add(from.str(it.sha256));
+  it.kinds = 0;
+  for (size_t k = 0; k < from.kinds.size(); k++) {
+    if (from[i].kinds & 1u << k) {
+      it.kinds |= to.kindBit(from.kinds[k]);
+    }
+  }
+  to.items.push_back(it);
+}
+
+// how a name starts, for the order of the names: lower case, 0 after a short name
+static void prefixOf(const char* name, size_t n, char prefix[12]) {
+  for (size_t i = 0; i < 12; i++) {
+    prefix[i] = i < n ? (char)tolower((uint8_t)name[i]) : 0;
+  }
+}
+
+// the name on the line of the list file at "at" (the field before the first tab)
+static bool nameAt(FILE* f, uint32_t at, std::string& name) {
+  if (fseek(f, at, SEEK_SET) || !readLine(f, name)) {
+    return false;
+  }
+  name.erase(std::min(name.find('\t'), name.size()));
+  return true;
+}
+
+// the files of /fm1 in a list on the card, and the index of it in memory
+catalog::SdScan catalog::readSd(FwList* hubList) {
+  SdScan scan;
+  FwList none;
+  FwList& hub = hubList ? *hubList : none;
   for (FwItem& h : hub.items) {
     h.flags &= ~FwItem::ON_SD;
   }
-  FwList list;
-  roomy(list);
   std::string dir = path(FW_DIR);
   if (dir.empty()) {
-    sd.swap(list);
-    return 0;
+    scan.complete = true;
+    return scan;
   }
-  SdFiles pkgs;
-  listPkgs(dir, pkgs);
-  std::string cache;
-  readCache(cache);
-  int unknown = 0;
-  for (const SdFile& p : pkgs.list) {
-    const char* name = pkgs.names.c_str() + p.name;  // (its path in /fm1)
-    std::string base = baseName(name);
-    // what it is: by its sha256 (a Hub firmware, or one of M-VAVE's), not by its name. Until that's known (it's
-    // read in the background: hashSd), a Hub firmware by its file name and size (the install checks the sha256)
-    std::string sha, prod;
-    if (!cached(cacheKey(name, p.size, p.mtime), cache, sha, prod)) {
-      unknown++;
-      prod = product((dir + "/" + name).c_str());
-    }
-    FwItem it{};
-    it.line = FwItem::NO_LINE;
-    it.size = p.size;
-    it.flags = FwItem::ON_SD;
-    // the Hub can have the same file more than once (M-VAVE's stock firmware, in another firmware's repo: issue #88):
-    // all of them are on the card, and it's named after M-VAVE's own, else the one with its file name, else the first
-    size_t h = hub.size();
-    int best = -1;
-    for (size_t k = 0; k < hub.size(); k++) {
-      FwItem& x = hub.items[k];
-      bool sameName = !strcasecmp(hub.str(x.file), base.c_str());
-      if (sha.empty() ? x.size == it.size && sameName : !strcasecmp(hub.str(x.sha256), sha.c_str())) {
-        x.flags |= FwItem::ON_SD;
-        int score = (x.flags & FwItem::STOCK ? 2 : 0) + (sameName ? 1 : 0);
-        if (score > best) {
-          best = score, h = k;
+  const uint32_t began = hal::millis();
+  mkdir(path(DATA_DIR).c_str(), 0777);
+  const std::string listing = tempName("scan"), raw = tempName("raw"), file = tempName("list");
+  uint32_t found = 0;
+  bool whole = listPkgs(dir, listing, found);
+
+  // the files, with what is known of each, one line each (the cache index is in memory, and nothing else of the scan)
+  FILE* in = fopen(path(listing).c_str(), "rb");
+  FILE* out = fopen(path(raw).c_str(), "wb");
+  uint32_t lines = 0, unknown = 0;
+  if (in && out) {
+    fputs(SD_HEAD "\n", out);
+    std::lock_guard<std::mutex> lock(cacheMu);
+    CacheIndex cache;
+    openCacheIndex(cache);
+    FwList one;
+    std::string line;
+    for (size_t i = 0; readLine(in, line); i++) {
+      const char* v[4];
+      if (line.empty() || line[0] == '#' || split(line, v, 4) != 3) {
+        continue;
+      }
+      if (!(i & 15)) {
+        hal::idle();
+      }
+      const char* name = v[0];  // (its path in /fm1)
+      const uint32_t size = strtoul(v[1], 0, 10), mtime = strtoul(v[2], 0, 10);
+      std::string base = baseName(name);
+      // what it is: by its sha256 (a Hub firmware, or one of M-VAVE's), not by its name. Until that's known (it's
+      // read in the background: hashSd), a Hub firmware by its file name and size (the install checks the sha256)
+      std::string sha, prod;
+      if (!cacheFind(cache, cacheKey(name, size, mtime), sha, prod)) {
+        unknown++;
+        prod = product((dir + "/" + name).c_str());
+      }
+      empty(one);
+      FwItem it{};
+      it.line = FwItem::NO_LINE;
+      it.size = size;
+      it.flags = FwItem::ON_SD;
+      // the Hub can have the same file more than once (M-VAVE's stock firmware, in another firmware's repo: issue #88):
+      // all of them are on the card, and it's named after M-VAVE's own, else the one with its file name, else the first
+      size_t h = hub.size();
+      int best = -1;
+      for (size_t k = 0; k < hub.size(); k++) {
+        FwItem& x = hub.items[k];
+        bool sameName = !strcasecmp(hub.str(x.file), base.c_str());
+        if (sha.empty() ? x.size == it.size && sameName : !strcasecmp(hub.str(x.sha256), sha.c_str())) {
+          x.flags |= FwItem::ON_SD;
+          int score = (x.flags & FwItem::STOCK ? 2 : 0) + (sameName ? 1 : 0);
+          if (score > best) {
+            best = score, h = k;
+          }
         }
       }
-    }
-    int o = sha.empty() ? -1 : official(sha.c_str());
-    if (h < hub.size() && !(o >= 0 && !(hub.items[h].flags & FwItem::STOCK))) {
-      const FwItem& x = hub.items[h];
-      it.name = list.add(hub.str(x.name));
-      it.author = list.add(hub.str(x.author));
-      it.version = list.add(hub.str(x.version));
-      it.date = list.add(hub.str(x.date));
-      it.line = x.line;
-      it.flags |= FwItem::FROM_HUB | (x.flags & (FwItem::BETA | FwItem::STOCK));
-      for (size_t k = 0; k < hub.kinds.size(); k++) {
-        if (x.kinds & 1u << k) {
-          it.kinds |= list.kindBit(hub.kinds[k]);
+      int o = sha.empty() ? -1 : official(sha.c_str());
+      if (h < hub.size() && !(o >= 0 && !(hub.items[h].flags & FwItem::STOCK))) {
+        const FwItem& x = hub.items[h];
+        it.name = one.add(hub.str(x.name));
+        it.author = one.add(hub.str(x.author));
+        it.version = one.add(hub.str(x.version));
+        it.date = one.add(hub.str(x.date));
+        it.line = x.line;
+        it.flags |= FwItem::FROM_HUB | (x.flags & (FwItem::BETA | FwItem::STOCK));
+        for (size_t k = 0; k < hub.kinds.size(); k++) {
+          if (x.kinds & 1u << k) {
+            it.kinds |= one.kindBit(hub.kinds[k]);
+          }
         }
+      } else if (o >= 0) {
+        it.name = one.add(OFFICIAL[o].name);
+        it.author = one.add("M-VAVE");
+        it.kinds = one.kindBit(OFFICIAL[o].open ? "groove" : "stock");
+        it.flags |= OFFICIAL[o].open ? 0 : FwItem::STOCK;
+      } else {
+        it.name = one.add(base.c_str(), base.size() - 5);
       }
-    } else if (o >= 0) {
-      it.name = list.add(OFFICIAL[o].name);
-      it.author = list.add("M-VAVE");
-      it.kinds = list.kindBit(OFFICIAL[o].open ? "groove" : "stock");
-      it.flags |= OFFICIAL[o].open ? 0 : FwItem::STOCK;
-    } else {
-      it.name = list.add(base.c_str(), base.size() - 5);
+      it.file = one.add(name);
+      it.product = one.add(prod);
+      it.sha256 = one.add(sha);
+      one.items.push_back(it);
+      writeSdLine(out, one);
+      lines++;
     }
-    it.file = list.add(name);
-    it.product = list.add(prod);
-    it.sha256 = list.add(sha);
-    list.items.push_back(it);
   }
-  std::sort(list.items.begin(), list.items.end(),
-            [&](const FwItem& a, const FwItem& b) { return strcasecmp(list.str(a.name), list.str(b.name)) < 0; });
-  sd.swap(list);
+  bool good = in && out && !ferror(out);
+  if (in) {
+    fclose(in);
+  }
+  if (out) {
+    good &= !fclose(out);
+  }
+  remove(path(listing).c_str());
+  if (!good) {
+    hal::log("sd: the list of the packages did not write (errno %d)", errno);
+  }
+
+  // the index of the list (the cache index is gone): one block, the whole size or smaller while it does not fit
+  size_t room = lines;
+  while (room && !(scan.index = new (std::nothrow) SdEntry[room])) {
+    room /= 2;
+  }
+  FILE* list = out ? fopen(path(raw).c_str(), "rb") : 0;
+  if (list && room) {
+    std::string line;
+    uint32_t at = 0;
+    if (readLine(list, line)) {  // (the head line)
+      at = line.size() + 1;
+    }
+    for (size_t i = 0; scan.shown < room && readLine(list, line); i++) {
+      SdEntry& e = scan.index[scan.shown++];
+      e.line = at;
+      prefixOf(line.c_str(), std::min(line.find('\t'), line.size()), e.prefix);
+      at += line.size() + 1;
+      if (!(i & 15)) {
+        hal::idle();
+      }
+    }
+    // by name (as strcasecmp does): the start of each name, and the names themselves when the starts are the same
+    std::string a, b;
+    std::sort(scan.index, scan.index + scan.shown, [&](const SdEntry& x, const SdEntry& y) {
+      if (int c = memcmp(x.prefix, y.prefix, sizeof x.prefix)) {
+        return c < 0;
+      }
+      if (memchr(x.prefix, 0, sizeof x.prefix) || !nameAt(list, x.line, a) || !nameAt(list, y.line, b)) {
+        return x.line < y.line;  // (the same name)
+      }
+      int c = strcasecmp(a.c_str(), b.c_str());
+      return c ? c < 0 : x.line < y.line;
+    });
+  }
+  // the list again, in the order of the names (a page, and the sort of a next scan, read it in that order)
+  FILE* sorted = list ? fopen(path(file).c_str(), "wb") : 0;
+  const bool listed = sorted;
+  if (sorted) {
+    fputs(SD_HEAD "\n", sorted);
+    std::string line;
+    uint32_t at = strlen(SD_HEAD) + 1, i = 0;
+    for (; i < scan.shown; i++) {
+      if (!(i & 15)) {
+        hal::idle();
+      }
+      if (fseek(list, scan.index[i].line, SEEK_SET) || !readLine(list, line) || fprintf(sorted, "%s\n", line.c_str()) < 0) {
+        break;
+      }
+      scan.index[i].line = at;
+      at += line.size() + 1;
+    }
+    good &= i == scan.shown && !ferror(sorted);
+    scan.shown = i;
+    good &= !fclose(sorted);
+  } else {
+    good = false;
+    scan.shown = 0;
+  }
+  if (list) {
+    fclose(list);
+  }
+  remove(path(raw).c_str());
+  scan.found = found;
+  scan.unknown = unknown;
+  scan.complete = whole && good && scan.shown == found;
+  scan.file = listed ? file : "";
+  hal::log("sd: %u found, %u shown, %u with no sha256%s (%u ms)", (unsigned)scan.found, (unsigned)scan.shown,
+           (unsigned)scan.unknown, scan.complete ? "" : ", not complete", (unsigned)(hal::millis() - began));
+  return scan;
+}
+
+void catalog::dropSd(SdScan& scan) {
+  if (!scan.file.empty()) {
+    remove(path(scan.file).c_str());
+  }
+  scan.file.clear();
+  delete[] scan.index;
+  scan.index = 0;
+  scan.shown = 0;
+}
+
+// the SD list the pages read: the last scan to be taken. With keepSd false, its file is SD_LIST, and its index is here
+static std::mutex sdMu;
+static catalog::SdScan installed;
+
+// the list of a scan in memory, in the order of the names
+static void fillFrom(const catalog::SdScan& scan, FwList& list) {
+  FILE* f = scan.file.empty() ? 0 : fopen(catalog::path(scan.file).c_str(), "rb");
+  if (!f) {
+    return;
+  }
+  roomy(list);
+  std::string line;
+  for (uint32_t i = 0; i < scan.shown; i++) {
+    if (!(i & 15)) {
+      hal::idle();
+    }
+    if (!fseek(f, scan.index[i].line, SEEK_SET) && readLine(f, line)) {
+      addSdLine(line, list);
+    }
+  }
+  fclose(f);
+}
+
+// the scan is the SD list. With keepSd, it is in memory, in "into"; else SD_LIST is its file
+static void install(catalog::SdScan& scan, FwList* into) {
+  using namespace catalog;
+  std::lock_guard<std::mutex> lock(sdMu);
+  if (keepSd) {
+    FwList list;
+    fillFrom(scan, list);
+    SdScan counts = scan;  // (what the pages ask of the list in memory)
+    counts.file.clear(), counts.index = 0;
+    dropSd(scan);
+    into->swap(list);
+    delete[] installed.index;
+    installed = counts;
+    return;
+  }
+  if (!scan.file.empty()) {
+    remove(path(SD_LIST).c_str());  // (a card of FAT does not rename onto a file)
+    if (rename(path(scan.file).c_str(), path(SD_LIST).c_str())) {
+      hal::log("sd: can't make %s (errno %d)", SD_LIST, errno);
+      dropSd(scan);
+      return;
+    }
+  }
+  delete[] installed.index;
+  installed = scan;
+  if (!scan.file.empty()) {
+    installed.file = SD_LIST;
+  }
+  scan.file.clear();
+  scan.index = 0;
+  scan.shown = 0;
+  FwList::changes++;
+}
+
+void catalog::takeSd(SdScan& scan) {
+  const uint32_t unknown = scan.unknown;
+  install(scan, &sd);
+  if (unknown) {
+    hashSd();
+  }
+}
+
+int catalog::scanSdInto(FwList& hub, FwList& sd) {
+  SdScan scan = readSd(&hub);
+  const int unknown = scan.unknown;
+  install(scan, &sd);
   return unknown;
 }
 
-// the sha256 (and product) of the files the cache doesn't know yet (seconds each), on a thread of their own; the
-// cache is written as it goes (so a restart meanwhile keeps what's done), and keeps only the files that are there
+uint32_t catalog::sdShown(const SdScan* scan) {
+  std::lock_guard<std::mutex> lock(sdMu);
+  return scan ? scan->shown : keepSd ? (uint32_t)sd.size()
+                                     : installed.shown;
+}
+
+uint32_t catalog::sdFound(const SdScan* scan) {
+  std::lock_guard<std::mutex> lock(sdMu);
+  return (scan ? scan : &installed)->found;
+}
+
+uint32_t catalog::sdUnknown(const SdScan* scan) {
+  std::lock_guard<std::mutex> lock(sdMu);
+  return (scan ? scan : &installed)->unknown;
+}
+
+bool catalog::sdComplete(const SdScan* scan) {
+  std::lock_guard<std::mutex> lock(sdMu);
+  return (scan ? scan : &installed)->complete;
+}
+
+bool catalog::openSd(FILE*& f, const SdScan* scan) {
+  f = 0;
+  if (!scan && keepSd) {
+    return true;  // (in memory)
+  }
+  if (scan && scan->file.empty()) {
+    return false;
+  }
+  f = fopen(path(scan ? scan->file : SD_LIST).c_str(), "rb");
+  return f;
+}
+
+bool catalog::sdAt(FILE* f, size_t i, FwList& one, const SdScan* scan) {
+  empty(one);
+  std::unique_lock<std::mutex> lock(sdMu, std::defer_lock);
+  if (!scan) {
+    lock.lock();
+    if (keepSd) {
+      if (i >= sd.size()) {
+        return false;
+      }
+      copyItem(sd, i, one);
+      return true;
+    }
+    scan = &installed;
+  }
+  std::string line;
+  return f && i < scan->shown && !fseek(f, scan->index[i].line, SEEK_SET) && readLine(f, line) && addSdLine(line, one);
+}
+
+bool catalog::sdAt(size_t i, FwList& one, const SdScan* scan) {
+  FILE* f;
+  if (!openSd(f, scan)) {
+    empty(one);
+    return false;
+  }
+  bool ok = sdAt(f, i, one, scan);
+  if (f) {
+    fclose(f);
+  }
+  return ok;
+}
+
+int catalog::sdFind(const char* file, const SdScan* scan) {
+  FILE* f;
+  if (!openSd(f, scan)) {
+    return -1;
+  }
+  FwList one;
+  int found = -1;
+  for (size_t i = 0, n = sdShown(scan); found < 0 && i < n; i++) {
+    found = sdAt(f, i, one, scan) && !strcmp(one.str(one[0].file), file) ? (int)i : -1;
+  }
+  if (f) {
+    fclose(f);
+  }
+  return found;
+}
+
+// a line to the end of the cache (whole: the last line of the file ends with a '\n'), at once
+static bool appendCache(const std::string& line) {
+  std::lock_guard<std::mutex> lock(cacheMu);
+  mkdir(catalog::path(DATA_DIR).c_str(), 0777);
+  FILE* c = fopen(catalog::path(SHA_CACHE).c_str(), "ab+");
+  if (!c) {
+    hal::log("sd: can't write %s (errno %d)", SHA_CACHE, errno);
+    return false;
+  }
+  fseek(c, 0, SEEK_END);
+  long n = ftell(c);
+  if (n > 0 && !fseek(c, n - 1, SEEK_SET) && fgetc(c) != '\n') {
+    fseek(c, 0, SEEK_END);
+    fputc('\n', c);
+  }
+  fseek(c, 0, SEEK_END);
+  bool ok = fwrite(line.data(), 1, line.size(), c) == line.size() && !ferror(c);
+  if (fclose(c) || !ok) {
+    hal::log("sd: writing %s failed (errno %d)", SHA_CACHE, errno);
+    return false;
+  }
+  return true;
+}
+
+// The cache again with one line for each file of the listing, and none for the files that are gone: line by line into a
+// file of its own, then it takes the place of the cache. false: not written (the cache stays as it was)
+static bool rewriteCache(const std::string& listing) {
+  const std::string temp = tempName("sha");
+  FILE* in = fopen(catalog::path(listing).c_str(), "rb");
+  FILE* out = fopen(catalog::path(temp).c_str(), "wb");
+  bool ok = in && out;
+  {
+    CacheIndex cache;
+    {
+      std::lock_guard<std::mutex> lock(cacheMu);
+      openCacheIndex(cache);
+    }
+    ok = ok && !cache.failed;
+    std::string line, sha, prod;
+    for (size_t i = 0; ok && readLine(in, line); i++) {
+      const char* v[4];
+      if (line.empty() || line[0] == '#' || split(line, v, 4) != 3) {
+        continue;
+      }
+      if (!(i & 15)) {
+        hal::idle();
+      }
+      std::string key = cacheKey(v[0], strtoul(v[1], 0, 10), strtoul(v[2], 0, 10));
+      cacheFind(cache, key, sha, prod);
+      if (!sha.empty()) {
+        std::string text = cacheLine(key, sha, prod);
+        ok = fputs(text.c_str(), out) >= 0;
+      }
+    }
+  }  // (the index closes the old cache)
+  if (in) {
+    fclose(in);
+  }
+  if (out) {
+    ok = ok && !ferror(out) && !fclose(out);
+  }
+  if (ok) {
+    std::lock_guard<std::mutex> lock(cacheMu);
+    remove(catalog::path(SHA_CACHE).c_str());  // (a rename on the card does not replace a file)
+    ok = !rename(catalog::path(temp).c_str(), catalog::path(SHA_CACHE).c_str());
+  }
+  if (!ok) {
+    hal::log("sd: can't write the new %s (errno %d)", SHA_CACHE, errno);
+    remove(catalog::path(temp).c_str());
+  }
+  return ok;
+}
+
+// the sha256 (and product) of the files the cache doesn't know yet (seconds each), on a thread of their own; each line
+// goes to the end of the cache as it's known (so a restart meanwhile keeps what's done), and after a whole listing the
+// cache is written again with only the files that are there
 static void hashTask(void*) {
   uint32_t t = hal::millis();
-  std::string dir = catalog::path(FW_DIR), cache, kept;
-  readCache(cache);
+  const std::string dir = catalog::path(FW_DIR), listing = tempName("hash");
+  uint32_t found = 0;
   int done = 0;
-  bool ok = true;
-  SdFiles pkgs;
-  bool whole = !dir.empty() && listPkgs(dir, pkgs);
-  for (const SdFile& p : pkgs.list) {
-    const char* name = pkgs.names.c_str() + p.name;
-    std::string full = dir + "/" + name, key = cacheKey(name, p.size, p.mtime), sha, prod;
-    hal::idle();  // (many files to read, one after the other: the idle task runs, or the watchdog restarts the board)
-    if (!cached(key, cache, sha, prod)) {
+  bool whole = false, ran = !dir.empty();
+  {
+    CacheIndex cache;
+    if (ran) {
+      mkdir(catalog::path(DATA_DIR).c_str(), 0777);
+      whole = listPkgs(dir, listing, found);
+      std::lock_guard<std::mutex> lock(cacheMu);
+      openCacheIndex(cache);
+      ran = !cache.failed;
+    }
+    FILE* in = ran ? fopen(catalog::path(listing).c_str(), "rb") : 0;
+    std::string line;
+    for (size_t i = 0; in && readLine(in, line); i++) {
+      const char* v[4];
+      if (line.empty() || line[0] == '#' || split(line, v, 4) != 3) {
+        continue;
+      }
+      const std::string full = dir + "/" + v[0];
+      const std::string key = cacheKey(v[0], strtoul(v[1], 0, 10), strtoul(v[2], 0, 10));
+      std::string sha, prod;
+      hal::idle();  // (many files to read, one after the other: the idle task runs, or the watchdog restarts the board)
+      if (cacheFind(cache, key, sha, prod)) {
+        continue;
+      }
       if (sha.empty()) {
         char hex[65];
         if (!hal::sha256(full.c_str(), hex)) {
@@ -866,24 +1441,25 @@ static void hashTask(void*) {
         sha = hex;
       }
       prod = catalog::product(full.c_str());
-      std::string line = cacheLine(key, sha, prod);
-      {
-        std::lock_guard<std::mutex> l(knownMu);
-        known += line;
-      }
-      if (++done % 20 == 0 && ok) {
-        ok = writeCache(kept + line + cache.substr(1));  // (the ones still to go keep their old lines)
+      if (appendCache(cacheLine(key, sha, prod))) {
+        done++;
       }
     }
-    kept += cacheLine(key, sha, prod);
+    if (in) {
+      fclose(in);
+    }
+  }  // (the index closes the cache)
+  bool ok = true;
+  if (ran && whole) {
+    ok = rewriteCache(listing);  // (one line for each key: the old line of a key that got a new one, and the line of a gone file, go)
   }
-  if (!whole) {  // (the files it didn't see keep their lines)
-    kept += cache.substr(1);
+  if (!dir.empty()) {
+    remove(catalog::path(listing).c_str());
   }
-  if (ok && (done || kept.size() + 1 != cache.size())) {
-    ok = writeCache(kept);
+  if (!ran && !dir.empty()) {
+    hal::log("sd: no room for the SHA task: no cache line changed");
   }
-  hal::log("sd: %d read (%u ms), %u files%s", done, (unsigned)(hal::millis() - t), (unsigned)pkgs.list.size(),
+  hal::log("sd: %d read (%u ms), %u files%s", done, (unsigned)(hal::millis() - t), (unsigned)found,
            ok ? "" : ": cache not written");
   hashedNew = hashedNew || done;
   hashing = false;
@@ -945,7 +1521,6 @@ bool catalog::matchHub(syncplan::HubMatch& m) {
 }
 
 void catalog::scanSd() {
-  if (scanSdInto(hub, sd)) {
-    hashSd();
-  }
+  SdScan scan = readSd(&hub);
+  takeSd(scan);
 }

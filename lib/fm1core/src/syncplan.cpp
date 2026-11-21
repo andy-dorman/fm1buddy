@@ -5,6 +5,8 @@
 #include <string.h>
 #include <strings.h>
 
+#include <algorithm>
+#include <new>
 #include <vector>
 
 #include "catalog.h"
@@ -358,12 +360,31 @@ static void get(FILE* out, const char* kind, const char* const v[], const char* 
   fputc('\n', out);
 }
 
-bool syncplan::plan(FILE* hubList, FILE* record, const SdFile* files, size_t count, FILE* out) {
+// one file of /fm1: 16 bytes, so 1,000 files take 16 KB in one block. The entries are in the order of their hashes
+struct SdEntry {
+  uint64_t hash;     // of the path of the file
+  uint32_t at : 31;  // where the file is in the source
+  uint32_t recorded : 1;
+};
+
+static bool before(const SdEntry& a, const SdEntry& b) {
+  return a.hash != b.hash ? a.hash < b.hash : a.at < b.at;
+}
+
+// the first entry from (hash, at) on, if it has this hash: null if there is none
+static SdEntry* findEntry(SdEntry* entries, size_t count, uint64_t hash, uint32_t at = 0) {
+  SdEntry* e = std::lower_bound(entries, entries + count, SdEntry{hash, at, 0}, before);
+  return e != entries + count && e->hash == hash ? e : 0;
+}
+
+// the actions, from the Hub list (its head is read), the sync record, and the entries of the files: false (and nothing
+// written) when the Hub list can't be read again
+static bool writeActions(FILE* hubList, FILE* record, const syncplan::SdSource& files, SdEntry* entries, size_t count,
+                         FILE* out) {
   std::string line;
   const char* v[HUB_LIST_FIELDS + 1];
-  if (!hubList || !readLine(hubList, line) || split(line, v, 3) != 2 || strcmp(v[0], HUB_LIST_HEAD)) {
-    return false;
-  }
+  using namespace syncplan;
+  // (the head of the Hub list is read: the plan checked it)
   // each firmware key once: of the FM-1's entries, the newest
   // (the lines are counted first: the keys are one block, never a bigger one after a smaller)
   std::vector<Key> keys;
@@ -397,29 +418,25 @@ bool syncplan::plan(FILE* hubList, FILE* record, const SdFile* files, size_t cou
     }
   }
   // the sync record: each recorded file
-  std::vector<bool> recorded(count, false);
   std::string rec;
   while (record && readLine(record, rec)) {
     const char* r[5];
     if (rec[0] == removedMark || split(rec, r, 5) != 4) {
       continue;  // (the head, a line that isn't a file's, or a file that a sync removed)
     }
-    size_t at = 0;
-    while (at < count && strcmp(files[at].path, r[0])) {
-      at++;
-    }
-    if (at < count) {
-      recorded[at] = true;
+    SdEntry* at = findEntry(entries, count, hashOf(r[0]));
+    if (at) {
+      at->recorded = 1;
     }
     if (!strncmp(r[3], "extra:", 6)) {
       continue;  // (an extra source: the sync never takes it away)
     }
     Key* k = find(keys, hashOf(r[3]));
     if (!k) {
-      if (at < count) {
+      if (at) {
         fprintf(out, "remove\t%s\n", r[0]);  // (no entry of any device holds its key)
       }
-    } else if ((k->flags & Key::FM1) && !(k->flags & Key::HANDLED) && at < count) {
+    } else if ((k->flags & Key::FM1) && !(k->flags & Key::HANDLED) && at) {
       std::string text;
       if (!lineAt(hubList, k->line, text, v)) {
         continue;
@@ -433,13 +450,16 @@ bool syncplan::plan(FILE* hubList, FILE* record, const SdFile* files, size_t cou
     }
   }
   // a file of the user holds the key of a Hub firmware: the firmware stays as the user has it
-  for (size_t i = 0; i < count; i++) {
-    if (recorded[i] || !*files[i].product) {
+  files.rewind(files.arg);
+  SdFile file;
+  for (uint32_t i = 0; i < count && files.next(files.arg, file); i++) {
+    SdEntry* e = findEntry(entries, count, hashOf(file.path), i);
+    if ((e && e->recorded) || !*file.product) {
       continue;
     }
-    Key* k = find(keys, hashOf(firmwareKey(files[i].product, files[i].path)));
+    Key* k = find(keys, hashOf(firmwareKey(file.product, file.path)));
     if (k && (k->flags & Key::FM1) && !(k->flags & Key::HANDLED)) {
-      fprintf(out, "skip\t%s\n", files[i].path);
+      fprintf(out, "skip\t%s\n", file.path);
       k->flags |= Key::HANDLED;
     }
   }
@@ -451,4 +471,53 @@ bool syncplan::plan(FILE* hubList, FILE* record, const SdFile* files, size_t cou
     }
   }
   return true;
+}
+
+syncplan::PlanResult syncplan::plan(FILE* hubList, FILE* record, const SdSource& files, bool scanComplete,
+                                    FILE* out) {
+  std::string line;
+  const char* v[HUB_LIST_FIELDS + 1];
+  if (!hubList || !readLine(hubList, line) || split(line, v, 3) != 2 || strcmp(v[0], HUB_LIST_HEAD)) {
+    return PLAN_NO_HUB_LIST;
+  }
+  if (!scanComplete) {
+    return PLAN_INCOMPLETE_SCAN;  // (a part of the library: the files that the plan can't see would look removed)
+  }
+  // the files are counted first, and the entries are one block (never a bigger one after a smaller). A failed
+  // allocation is an incomplete scan: the plan can't see all the files
+  size_t count = 0;
+  SdFile file;
+  files.rewind(files.arg);
+  while (files.next(files.arg, file)) {
+    count++;
+  }
+  SdEntry* entries = new (std::nothrow) SdEntry[count ? count : 1];
+  if (!entries) {
+    return PLAN_INCOMPLETE_SCAN;
+  }
+  files.rewind(files.arg);
+  for (size_t i = 0; i < count && files.next(files.arg, file); i++) {
+    entries[i] = SdEntry{hashOf(file.path), (uint32_t)i, 0};
+  }
+  std::sort(entries, entries + count, before);
+  bool written = writeActions(hubList, record, files, entries, count, out);
+  delete[] entries;
+  return written ? PLAN_WRITTEN : PLAN_NO_HUB_LIST;
+}
+
+bool syncplan::plan(FILE* hubList, FILE* record, const SdFile* files, size_t count, FILE* out) {
+  struct Array {
+    const SdFile* files;
+    size_t count, at;
+  } array = {files, count, 0};
+  SdSource source = {&array, [](void* arg) { ((Array*)arg)->at = 0; },
+                     [](void* arg, SdFile& file) {
+                       Array& a = *(Array*)arg;
+                       if (a.at >= a.count) {
+                         return false;
+                       }
+                       file = a.files[a.at++];
+                       return true;
+                     }};
+  return plan(hubList, record, source, true, out) == PLAN_WRITTEN;
 }

@@ -36,12 +36,30 @@ struct SdFile {
   uint32_t size;
 };
 
+// The files of /fm1, one at a time. The plan reads them in order, and starts again from the first file as often as it
+// needs. It keeps no pointer from one call of next to the next
+struct SdSource {
+  void* arg;
+  void (*rewind)(void* arg);              // the next file is the first file again
+  bool (*next)(void* arg, SdFile& file);  // the next file: false at the end. Its strings live until the next call
+};
+
+enum PlanResult {
+  PLAN_WRITTEN,         // the actions are in out
+  PLAN_NO_HUB_LIST,     // the Hub list isn't of the head HUB_LIST_HEAD: nothing is written
+  PLAN_INCOMPLETE_SCAN  // scanComplete is false, or the plan has no room for its entries: nothing is written
+};
+
 // The actions of one sync, a line each, fields between tabs, to out:
 //   download <target> <pkg> <sha256> <size> <name> <version> <product>
 //   replace  <target> <pkg> <sha256> <size> <name> <version> <product> <old path>
 //   remove   <path>
 //   skip     <path>
-// false (and nothing written) when the Hub list isn't of the head HUB_LIST_HEAD
+// scanComplete: false when the files of the source are not all the files of /fm1. A sync of a part of the library
+// would remove files that it can't see, so the plan writes nothing then
+PlanResult plan(FILE* hubList, FILE* record, const SdSource& files, bool scanComplete, FILE* out);
+// the same for an array of files, in memory: false (and nothing written) when the Hub list isn't of the head
+// HUB_LIST_HEAD
 bool plan(FILE* hubList, FILE* record, const SdFile* files, size_t count, FILE* out);
 
 // The sync record (SYNC_RECORD): the head, then a line a file: its path, its sha256, its size, and its firmware key (or

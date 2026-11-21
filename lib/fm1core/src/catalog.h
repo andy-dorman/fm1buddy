@@ -22,6 +22,7 @@
 #define INSTALLS_DIR DATA_DIR "/installs"    // a record of each install
 #define SYNC_RECORD DATA_DIR "/sync.txt"     // the files a sync wrote (syncplan.h)
 #define SYNC_PLAN DATA_DIR "/sync-plan.txt"  // what the last sync set out to do
+#define SD_LIST DATA_DIR "/sd-list.txt"      // the SD list on the card (keepSd off): a head line, then a line a package
 
 // a whole firmware: the one opened, the one being saved or installed
 struct Firmware {
@@ -103,11 +104,54 @@ bool hubAt(uint32_t line, FwList& one);
 FILE* openHub();
 bool hubAt(FILE* f, uint32_t line, FwList& one);
 // the files in /fm1, with what the Hub's list knows about them; marks the Hub's that are there. Quick: it reads no
-// whole file (a sha256 not known yet is read in the background: hashSd)
+// whole file (a sha256 not known yet is read in the background: hashSd). It is readSd, then takeSd
 void scanSd();
-// the same into sd, with the Hub's list hub (marked where it's on the card): from another thread. Returns how many
-// files have no sha256 yet
+// the same into sd (kept in memory when keepSd is true: the caller's list; on the card when it is false), with the
+// Hub's list hub (marked where it's on the card): from another thread. Returns how many files have no sha256 yet
 int scanSdInto(FwList& hub, FwList& sd);
+
+// ---------------------------------------------------------------------------------------------- the SD list ---
+// The list of the firmware library as the "Firmware: SD card" page shows it (a package of /fm1 on each line, in the
+// order of the names). With keepSd true it is in memory (catalog::sd). With keepSd false it is on the card (SD_LIST),
+// and memory holds one SdEntry for each package: the page, and each job, read a package at a time (sdAt)
+extern bool keepSd;
+
+// where a package line is in a list file, and how its name starts (lower case, 0 after a short name): for the sort
+struct SdEntry {
+  uint32_t line;
+  char prefix[12];
+};
+
+// The result of one scan of /fm1. A scan holds a file on the card with its own name and one block of SdEntry (shown
+// of them). Free both with takeSd (install) or dropSd (no one installs it)
+struct SdScan {
+  uint32_t found = 0;     // the packages in /fm1
+  uint32_t shown = 0;     // the packages the scan holds (fewer than found when memory is short)
+  uint32_t unknown = 0;   // the packages with no sha256 known yet
+  bool complete = false;  // false when the listing of /fm1 ended early, or shown is less than found
+  std::string file;       // its list on the card ("" if it has none)
+  SdEntry* index = 0;     // shown entries, in the order of the names
+};
+// /fm1 into a new SdScan, with the Hub's list hub (marked where it's on the card; 0: none). It installs nothing, and
+// it runs on any thread
+SdScan readSd(FwList* hub = 0);
+// the scan is the SD list the pages read (the UI thread only): its file is SD_LIST (keepSd false), or the list in
+// memory (keepSd true). Starts hashSd when a sha256 isn't known. The scan is spent
+void takeSd(SdScan& scan);
+// the scan of no one: its file is deleted, its block freed
+void dropSd(SdScan& scan);
+// What the SD list holds, from one scan (scan), or the installed one (0)
+uint32_t sdShown(const SdScan* scan = 0);
+uint32_t sdFound(const SdScan* scan = 0);
+uint32_t sdUnknown(const SdScan* scan = 0);
+bool sdComplete(const SdScan* scan = 0);
+// package i (0 is the first by name) into one (one[0]): false if it isn't there
+bool sdAt(size_t i, FwList& one, const SdScan* scan = 0);
+// the same from the list already open (openSd), for many at once: opening a file on an SD card on SPI is slow
+bool openSd(FILE*& f, const SdScan* scan = 0);  // false if it can't be read; f stays 0 for a list in memory
+bool sdAt(FILE* f, size_t i, FwList& one, const SdScan* scan = 0);
+// the place of the package with this file name in /fm1 ("zp12.fwsc", "drums/x.fwsc"): -1 if it isn't there
+int sdFind(const char* file, const SdScan* scan = 0);
 // read the sha256 of the files that don't have one yet, on a thread of its own (once at a time)
 void hashSd();
 // true once after hashSd learned something: time to scanSd again
