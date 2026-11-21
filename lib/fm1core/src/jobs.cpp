@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include "midi.h"
 #include "settings.h"
 #include "sloop.h"
+#include "syncplan.h"
 #include "uboot.h"
 
 namespace jobs {
@@ -39,6 +41,9 @@ std::string hubUpdated;
 int device = -1;
 sounds::Speaks speaks;
 std::string saved;
+std::atomic<uint32_t> syncAt{0}, syncOf{0};
+char syncName[48];
+std::atomic<uint32_t> syncNew{0}, syncUpdated{0}, syncUnchanged{0}, syncRemoved{0}, syncFailed{0};
 }  // namespace jobs
 
 using namespace jobs;
@@ -53,7 +58,7 @@ static void progress(uint32_t d, uint32_t t) {
 
 static const char* NAMES[] = {"none", "hub", "download", "scan", "join", "install", "probe", "send", "voice", "keep",
                               "restore", "export", "backup", "prepare", "recover", "sloop backup", "sloop restore",
-                              "sloop project", "sloop song", "sloop song in", "sloop samples", "identify", "check update", "firmware update", "update"};
+                              "sloop project", "sloop song", "sloop song in", "sloop samples", "identify", "check update", "firmware update", "sync", "update"};
 static_assert(sizeof NAMES / sizeof *NAMES == UPDATE + 1, "a name for each job");
 
 // a conversation in SysEx with the FM-1: routing stops meanwhile (its replies aren't for the other devices, and a
@@ -85,7 +90,7 @@ static bool start(Kind k, void (*fn)(void*)) {
 }
 
 static void finish(bool good) {
-  if (lowMemory && (kind == HUB || kind == DOWNLOAD)) {
+  if (lowMemory && (kind == HUB || kind == DOWNLOAD || kind == SYNC)) {
     hal::wifiOff();  // (Wi-Fi kept on holds ~30 KB of the internal RAM: joining again takes a few seconds)
   }
   hal::log("job: %s %s%s%s", NAMES[(int)kind], good ? "done" : "failed", good ? "" : ": ", good ? "" : error.c_str());
@@ -152,20 +157,15 @@ static std::string readText(const std::string& p) {
   return buf;
 }
 
-static void hubJob(void*) {
-  if (!hal::sd()) {
-    error = "No SD card: the list is kept on it.";
-    return finish(false);
-  }
-  if (!joinSaved(hubAsked)) {
-    return finish(false);
-  }
+// the Hub's list onto the SD card (HUB_LIST), with Wi-Fi joined: false (error says why)
+static bool getHub() {
   mkdirs();
   step = FETCHING;
   std::string etagPath = catalog::path(HUB_ETAG), cache = catalog::path(HUB_CACHE);
   struct stat st;
-  // (the list it's from is asked for again only if it's kept: else the whole list comes)
-  std::string etag = stat(catalog::path(HUB_LIST).c_str(), &st) ? "" : readText(etagPath);
+  // (the list it's from is asked for again only if it's kept and reads, in this format: else the whole list comes)
+  std::string kept;
+  std::string etag = stat(catalog::path(HUB_LIST).c_str(), &st) || !catalog::hubWhen(kept) ? "" : readText(etagPath);
   hal::logRam("before the list");
   hal::log("job: getting the list (etag %s)", etag.c_str());
   int code = hal::get(HUB_SITE "catalog.json", cache.c_str(), &etag, progress, error);
@@ -174,7 +174,7 @@ static void hubJob(void*) {
     if (code > 0) {
       error = "The Hub said " + std::to_string(code) + ".";
     }
-    return finish(false);
+    return false;
   }
   step = READING;
   bool ok;
@@ -190,7 +190,18 @@ static void hubJob(void*) {
     }
   }
   hal::logRam("the list read");
-  finish(ok);
+  return ok;
+}
+
+static void hubJob(void*) {
+  if (!hal::sd()) {
+    error = "No SD card: the list is kept on it.";
+    return finish(false);
+  }
+  if (!joinSaved(hubAsked)) {
+    return finish(false);
+  }
+  finish(getHub());
 }
 
 // ------------------------------------------------------------------------------------- fm1buddy's update ---
@@ -311,18 +322,15 @@ bool jobs::update() {
   return !updateTag.empty() && start(UPDATE, updateJob);
 }
 
-// target from the Hub into /fm1: false (error says why)
-static bool fetch() {
-  if (!hal::sd()) {
-    error = "No SD card.";
-    return false;
-  }
-  if (!joinSaved()) {
-    return false;
-  }
-  mkdirs();
+// target from the Hub into /fm1 as file (Wi-Fi joined already), then its size, its sha256 and its device checked: false
+// (error says why; the file is removed)
+static bool fetchFile(const std::string& file) {
   step = FETCHING;
-  std::string p = catalog::path(std::string(FW_DIR "/") + target.file);
+  std::string p = catalog::path(std::string(FW_DIR "/") + file);
+  size_t slash = file.rfind('/');
+  if (slash != std::string::npos) {
+    mkdir(catalog::path(FW_DIR "/" + file.substr(0, slash)).c_str(), 0777);  // (old-chip)
+  }
   hal::log("job: getting %s", target.pkg.c_str());
   std::string url = target.pkg;  // (a whole URL: the maker's own file)
   int code = hal::get(url.c_str(), p.c_str(), 0, progress, error);
@@ -347,6 +355,24 @@ static bool fetch() {
   }
   remove(p.c_str());
   return false;
+}
+
+// the SD card there and Wi-Fi joined (one time: it stays on), the folders made: false (error says why)
+static bool fetchReady() {
+  if (!hal::sd()) {
+    error = "No SD card.";
+    return false;
+  }
+  if (!joinSaved()) {
+    return false;
+  }
+  mkdirs();
+  return true;
+}
+
+// target from the Hub into /fm1: false (error says why)
+static bool fetch() {
+  return fetchReady() && fetchFile(target.file);
 }
 
 // a name in /fm1 for target that no other firmware has (the Hub has a few with the same file name: one mustn't replace
@@ -395,31 +421,419 @@ static std::string freeName(const std::string& file, const std::string& keep = "
   return file;  // (27 others of that name: it's replaced)
 }
 
+// the sync record again with the file just downloaded in it (through a .tmp file: the old record stays until the new one
+// is written). false if it can't be written
+static bool recordDownloaded(const std::string& key) {
+  std::string rec = catalog::path(SYNC_RECORD), tmp = rec + ".tmp";
+  if (rec.empty()) {
+    return false;
+  }
+  mkdir(catalog::path(DATA_DIR).c_str(), 0777);
+  FILE* in = fopen(rec.c_str(), "r");  // (null: there is no record yet)
+  FILE* out = fopen(tmp.c_str(), "w");
+  std::string path = std::string(FW_DIR "/") + target.file;
+  bool ok = out && syncplan::recordDownload(in, out, path.c_str(), target.sha256.c_str(), target.size, key.c_str()) &&
+            !fflush(out);
+  if (in) {
+    fclose(in);
+  }
+  if (out) {
+    fsync(fileno(out));
+    ok = !ferror(out) && !fclose(out) && ok;
+  }
+  if (ok) {
+    remove(rec.c_str());
+    ok = !rename(tmp.c_str(), rec.c_str());
+  }
+  if (!ok) {
+    remove(tmp.c_str());
+  }
+  return ok;
+}
+
 static void downloadJob(void*) {
+  std::string key = syncplan::firmwareKey(target.product, target.file);  // (before freeName: a number may join the name)
   target.file = freeName(target.file);
   bool ok = fetch();
   saved = target.file;
+  if (ok) {
+    bool recorded = recordDownloaded(key);  // (a failure leaves the file on the card; a later sync takes it for a file of the user)
+    hal::log("job: %s %s in the sync record", target.file.c_str(), recorded ? "is" : "can't go");
+  }
   finish(ok);
 }
 
 static std::string oldFile;  // FW_UPDATE: what the new one replaces
 
-static void fwUpdateJob(void*) {
-  std::string file = freeName(target.file, oldFile), dir = catalog::path(FW_DIR "/");
-  target.file = file + ".part";  // (old stays until the new one is checked, even with the same name)
-  if (!fetch()) {
+// target from the Hub into /fm1 (Wi-Fi joined already) in place of the file old ("": none) through a .part file: old
+// stays until the new one is checked, even with the same name. false (error says why; no .part stays)
+static bool replaceFile(const std::string& old) {
+  std::string file = freeName(target.file, old), dir = catalog::path(FW_DIR "/");
+  target.file = file + ".part";
+  if (!fetchFile(target.file)) {
     remove((dir + target.file).c_str());
-    return finish(false);
+    return false;
   }
-  remove((dir + oldFile).c_str());
+  if (!old.empty()) {
+    remove((dir + old).c_str());
+  }
   remove((dir + file).c_str());  // (the very same file, if it's there: freeName)
   if (rename((dir + target.file).c_str(), (dir + file).c_str())) {
     error = "Can't name it " + file + " on the SD card.";
-    return finish(false);
+    remove((dir + target.file).c_str());
+    return false;
   }
   target.file = saved = file;
-  hal::log("job: %s replaced by %s", oldFile.c_str(), file.c_str());
-  finish(true);
+  if (!old.empty()) {
+    hal::log("job: %s replaced by %s", old.c_str(), file.c_str());
+  }
+  return true;
+}
+
+// the sync record line of the file that one update replaced goes to the new file (a file with no line gets none)
+static bool recordMoved(const std::string& from, const std::string& to) {
+  std::string rec = catalog::path(SYNC_RECORD), tmp = rec + ".tmp";
+  FILE* in = fopen(rec.c_str(), "r");
+  if (rec.empty() || !in) {
+    return false;  // (no record: nothing to move)
+  }
+  FILE* out = fopen(tmp.c_str(), "w");
+  std::string was = std::string(FW_DIR "/") + from, now = std::string(FW_DIR "/") + to;
+  bool ok = out && syncplan::moveRecordLine(in, out, was.c_str(), now.c_str(), target.sha256.c_str(), target.size) &&
+            !fflush(out);
+  fclose(in);
+  if (out) {
+    fsync(fileno(out));
+    ok = !ferror(out) && !fclose(out) && ok;
+  }
+  if (ok) {
+    remove(rec.c_str());
+    ok = !rename(tmp.c_str(), rec.c_str());
+  }
+  if (!ok) {
+    remove(tmp.c_str());
+  }
+  return ok;
+}
+
+static void fwUpdateJob(void*) {
+  if (!fetchReady()) {
+    return finish(false);
+  }
+  std::string from = oldFile;
+  bool ok = replaceFile(from);
+  if (ok && !from.empty()) {
+    bool moved = recordMoved(from, target.file);  // (a failure leaves the old line: a later sync sees a missing file)
+    hal::log("job: sync record line of %s %s", target.file.c_str(), moved ? "moved" : "not moved");
+  }
+  finish(ok);
+}
+
+// ------------------------------------------------------------------------------------------------- sync ---
+// The Hub's firmwares into /fm1 as the sync plan says (syncplan.h). The sync record (SYNC_RECORD) holds the files it
+// wrote, a line after each file that is checked and a mark after each removal, so a stop or a power loss leaves it true
+static std::atomic<bool> stopSync{false};
+
+void jobs::cancel() {
+  stopSync = true;
+}
+
+static void setName(const char* s) {
+  snprintf(syncName, sizeof syncName, "%s", s);
+}
+
+// a line for the file just checked, and the mark on the line of a file removed (each written to the card at once)
+static bool recordNew(const char* path, const char* sha256, uint32_t size, const char* key) {
+  FILE* f = fopen(catalog::path(SYNC_RECORD).c_str(), "a");
+  if (!f) {
+    return false;
+  }
+  bool ok = syncplan::appendRecord(f, path, sha256, size, key) && !fflush(f);
+  fsync(fileno(f));
+  fclose(f);
+  return ok;
+}
+
+static bool recordGone(const char* path) {
+  FILE* f = fopen(catalog::path(SYNC_RECORD).c_str(), "r+");
+  if (!f) {
+    return false;
+  }
+  bool ok = syncplan::markRemoved(f, path);
+  fsync(fileno(f));
+  fclose(f);
+  return ok;
+}
+
+// the sync record again without the lines of the files that were removed
+static void recordRewritten() {
+  std::string rec = catalog::path(SYNC_RECORD), tmp = rec + ".tmp";
+  FILE* in = fopen(rec.c_str(), "r");
+  if (!in) {
+    return;
+  }
+  FILE* out = fopen(tmp.c_str(), "w");
+  bool ok = out && syncplan::rewriteRecord(in, out) && !fflush(out);
+  fclose(in);
+  if (out) {
+    fsync(fileno(out));
+    fclose(out);
+  }
+  if (ok) {
+    remove(rec.c_str());
+    ok = !rename(tmp.c_str(), rec.c_str());
+  }
+  if (!ok) {
+    remove(tmp.c_str());
+  }
+}
+
+// the plan for /fm1 as it is now, from the Hub's list and the sync record, into SYNC_PLAN: false if the list doesn't read
+static bool makePlan() {
+  FwList none, sd;  // (none: the Hub's list stays on the card)
+  catalog::scanSdInto(none, sd);
+  std::vector<std::string> paths;
+  std::vector<syncplan::SdFile> files;
+  paths.reserve(sd.items.size());  // (each in one block: the RAM is small)
+  files.reserve(sd.size());
+  for (const FwItem& it : sd.items) {
+    paths.push_back(std::string(FW_DIR "/") + sd.str(it.file));
+  }
+  for (size_t i = 0; i < sd.size(); i++) {
+    files.push_back({paths[i].c_str(), sd.str(sd[i].product), sd.str(sd[i].sha256), sd[i].size});
+  }
+  FILE* list = fopen(catalog::path(HUB_LIST).c_str(), "r");
+  FILE* rec = fopen(catalog::path(SYNC_RECORD).c_str(), "r");
+  FILE* out = fopen(catalog::path(SYNC_PLAN).c_str(), "w");
+  hal::logRam("before the plan");
+  bool good = list && out && syncplan::plan(list, rec, files.data(), files.size(), out);
+  hal::logRam("after the plan");
+  for (FILE* f : {list, rec, out}) {
+    if (f) {
+      fclose(f);
+    }
+  }
+  return good;
+}
+
+// one download or replace of the plan: a line of fields (n of them). The failed ones are counted and logged
+static void syncGet(const char* const v[], int n) {
+  const std::string root = FW_DIR "/";
+  target = Firmware();
+  target.file = v[1] + root.size();
+  target.pkg = v[2];
+  target.sha256 = v[3];
+  target.size = (uint32_t)strtoul(v[4], 0, 10);
+  target.name = v[5];
+  target.version = v[6];
+  target.product = v[7];
+  std::string hubFile = target.file, old = n > 8 ? v[8] + root.size() : "";
+  step = FETCHING;
+  const std::string reports = saved;  // (replaceFile puts the file's name in saved: a sync keeps its own lines there)
+  bool got = replaceFile(old);
+  saved = reports;
+  if (!got) {
+    hal::log("sync: %s: %s", v[5], error.c_str());
+    error.clear();
+    syncFailed++;
+    return;
+  }
+  // (the old file's line first: the new file can have its path)
+  if (!old.empty()) {
+    recordGone((root + old).c_str());
+  }
+  recordNew((root + target.file).c_str(), target.sha256.c_str(), target.size, syncplan::firmwareKey(target.product, hubFile).c_str());
+  (old.empty() ? syncNew : syncUpdated)++;
+}
+
+// ---------------------------------------------------------------------------------------- extra sources ---
+// Shrub and the sampler: one file each at a fixed address, flat in /fm1. syncplan::decideExtra says what to do with a
+// download (the sampler's address is the GitLab Pages one of its project: not final, and no file there yet)
+struct ExtraSource {
+  const char* name;  // in the sync record
+  const char* file;  // in /fm1
+  const char* url;
+};
+static const ExtraSource EXTRA_SOURCES[] = {
+    {"extra:shrub", "SHRUB.fwsc", "https://shrub.audio/editor/firmware/SHRUB.fwsc"},
+    {"extra:sampler", "fm1-sampler.fwsc", "https://aomegasolutions.gitlab.io/fm1-sampler-ios/fm1-sampler.fwsc"},
+};
+
+static long extraLength;  // the server's Content-Length of the download now (-1: none), from hal::get's progress
+
+static void extraProgress(uint32_t d, uint32_t t) {
+  progress(d, t);
+  if (t) {
+    extraLength = t;
+  }
+}
+
+// whether the sync record holds a line (not removed) for path
+static bool recordHolds(const std::string& path) {
+  FILE* f = fopen(catalog::path(SYNC_RECORD).c_str(), "r");
+  bool held = false;
+  std::string line;
+  while (f && !held && syncplan::readLine(f, line)) {
+    held = line.size() > path.size() && !line.compare(0, path.size(), path) && line[path.size()] == '\t';
+  }
+  if (f) {
+    fclose(f);
+  }
+  return held;
+}
+
+// a line for the end screen (saved) and the log
+static void extraReport(const std::string& report) {
+  hal::log("sync: %s", report.c_str());
+  saved += report + "\n";
+}
+
+// src from its address into /fm1 through a .part file, only if its sha256 isn't the recorded one
+static void syncExtra(const ExtraSource& src) {
+  const std::string label = src.name + 6, path = std::string(FW_DIR "/") + src.file;
+  const std::string real = catalog::path(path), part = real + ".part";
+  setName(label.c_str());
+  done = total = 0;
+  extraLength = -1;
+  hal::log("sync: getting %s", src.url);
+  int code = hal::get(src.url, part.c_str(), 0, extraProgress, error);
+  hal::log("sync: HTTP %d", code);
+  // (-1 is both no connection and a download cut short: the reason tells)
+  bool cut = code == -1 && (error.find("part way") != std::string::npos || error.find("Can't write") != std::string::npos ||
+                            error.find("Can't rename") != std::string::npos);
+  error.clear();
+  if (cut) {
+    remove(part.c_str());
+    syncFailed++;
+    return extraReport(label + ": the download stopped part way");
+  }
+  step = CHECKING;
+  struct stat st;
+  char sum[65] = "";
+  bool got = code == 200 && !stat(part.c_str(), &st);
+  uint32_t size = got ? (uint32_t)st.st_size : 0;
+  if (got && !hal::sha256(part.c_str(), sum)) {
+    sum[0] = 0;
+  }
+  std::string product = got ? catalog::product(part.c_str()) : "";
+  syncplan::SdFile there = {path.c_str(), "", "", 0};
+  bool exists = !stat(real.c_str(), &st);
+  FILE* rec = fopen(catalog::path(SYNC_RECORD).c_str(), "r");
+  syncplan::ExtraDecision d = syncplan::decideExtra(src.name, src.file, rec, &there, exists ? 1 : 0,
+                                                    {got, size, extraLength, sum, product.c_str()});
+  if (rec) {
+    fclose(rec);
+  }
+  bool hadLine = recordHolds(path);
+  step = FETCHING;
+  switch (d.result) {
+    case syncplan::EXTRA_UNCHANGED:
+      hal::log("sync: %s: unchanged", label.c_str());
+      syncUnchanged++;
+      break;
+    case syncplan::EXTRA_FAILED:
+      syncFailed++;
+      extraReport(d.report);
+      break;
+    case syncplan::EXTRA_USER_FILE:
+    case syncplan::EXTRA_NOT_FOUND:
+      extraReport(d.report);
+      break;
+    case syncplan::EXTRA_REPLACE:
+      remove(real.c_str());
+      if (rename(part.c_str(), real.c_str())) {
+        syncFailed++;
+        extraReport(label + ": can't name it " + src.file + " on the SD card");
+        break;
+      }
+      // (the new line before the mark on the old one: a stop between them leaves the file in the record)
+      recordNew(path.c_str(), sum, size, src.name);
+      if (hadLine) {
+        recordGone(path.c_str());
+      }
+      hal::log("sync: %s: %s", label.c_str(), exists ? "updated" : "new");
+      (exists ? syncUpdated : syncNew)++;
+      break;
+  }
+  remove(part.c_str());
+}
+
+// the sync after the extra sources: the Hub list, the plan, the downloads. true unless the sync failed (a stop is not
+// a failure)
+static bool syncHub() {
+  if (!getHub()) {
+    return false;
+  }
+  if (stopSync) {
+    return true;
+  }
+  step = READING;
+  if (!makePlan()) {
+    error = "The Hub's list on the SD card didn't read.";
+    return false;
+  }
+  std::string planPath = catalog::path(SYNC_PLAN), line;
+  FILE* plan = fopen(planPath.c_str(), "r");
+  if (!plan) {
+    error = "Can't read the sync plan on the SD card.";
+    return false;
+  }
+  while (syncplan::readLine(plan, line)) {
+    syncOf++;
+  }
+  rewind(plan);
+  bool good = true;
+  step = FETCHING;
+  done = total = 0;  // (the bytes of each file, from here)
+  while (!stopSync && syncplan::readLine(plan, line)) {
+    const char* v[12];
+    int n = syncplan::split(line, v, 12);
+    bool gets = n >= 8;  // (a download or a replace: the Hub's name for it)
+    const char* slash = n > 1 ? strrchr(v[1], '/') : 0;
+    setName(gets ? v[5] : slash ? slash + 1
+                                : "");
+    syncAt++;
+    if (!strcmp(v[0], "skip")) {
+      syncUnchanged++;
+    } else if (!strcmp(v[0], "remove") && n == 2) {
+      if (remove(catalog::path(v[1]).c_str()) && errno != ENOENT) {
+        hal::log("sync: %s: can't remove it", v[1]);
+        syncFailed++;
+      } else {
+        recordGone(v[1]);
+        syncRemoved++;
+      }
+    } else if (gets) {
+      if (!hal::wifiOn()) {
+        error = "Wi-Fi went away.";
+        good = false;
+        break;
+      }
+      syncGet(v, n);
+    }
+  }
+  fclose(plan);
+  return good;
+}
+
+static void syncJob(void*) {
+  if (!fetchReady()) {
+    return finish(false);
+  }
+  syncAt = syncOf = 0;
+  step = FETCHING;
+  for (const ExtraSource& src : EXTRA_SOURCES) {
+    if (!stopSync) {
+      syncExtra(src);
+    }
+  }
+  setName("");
+  done = total = 0;
+  // (one way out for the rest: the record is written again, without the lines of the files that were replaced or removed)
+  bool good = stopSync || syncHub();
+  recordRewritten();
+  setName("");
+  finish(good);
 }
 
 static std::atomic<uint32_t> askedAt;  // the update loader's last request (hal::millis)
@@ -542,6 +956,17 @@ bool jobs::updateFirmware(const Firmware& newer, const std::string& old) {
   target = newer;
   oldFile = old;
   return start(FW_UPDATE, fwUpdateJob);
+}
+
+bool jobs::sync() {
+  if (running) {
+    return false;
+  }
+  stopSync = false;
+  syncAt = syncOf = syncNew = syncUpdated = syncUnchanged = syncRemoved = syncFailed = 0;
+  setName("");
+  saved.clear();
+  return start(SYNC, syncJob);
 }
 
 bool jobs::install(const Firmware& f) {
@@ -1410,13 +1835,20 @@ bool jobs::sloopSamples(int d, const std::string& source, int slot) {
   return sloopStart(SLOOP_SAMPLES, d, source, 0, slot);
 }
 
+static std::string syncStatus() {
+  return "Syncing " + std::to_string(syncAt) + " of " + std::to_string(syncOf);
+}
+
 std::string jobs::status() {
   switch ((int)step) {
     case JOINING:
       return "Joining " + std::string(kind == JOIN ? ssid : settings.ssid) + "...";
     case FETCHING: {
-      if (kind == HUB) {
+      if (kind == HUB || (kind == SYNC && !syncOf)) {
         return "Getting the Hub's list...";
+      }
+      if (kind == SYNC) {
+        return syncStatus();
       }
       if (kind == CHECK_UPDATE) {
         return "Checking for an update...";
@@ -1429,7 +1861,7 @@ std::string jobs::status() {
       return t ? "Downloading " + std::to_string((unsigned long long)d * 100 / t) + "%" : "Downloading...";
     }
     case CHECKING:
-      return "Checking it...";
+      return kind == SYNC && syncOf ? syncStatus() : "Checking it...";
     case UPDATING: {
       uint32_t t = total, d = done;
       return "Installing " + std::to_string(t ? (unsigned long long)d * 100 / t : 0) + "%: keep it powered";

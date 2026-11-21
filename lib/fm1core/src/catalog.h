@@ -11,13 +11,17 @@
 #include <string>
 #include <vector>
 
+#include "syncplan.h"
+
 #define HUB_SITE "https://mutant.cloud/"
 #define FW_DIR "/fm1"
 #define DATA_DIR "/fm1buddy"
 #define HUB_CACHE DATA_DIR "/hub.json"  // the Hub's list as it comes, until parseHub has read it
 #define HUB_ETAG DATA_DIR "/hub.etag"
-#define HUB_LIST DATA_DIR "/hub.txt"       // the list as the board needs it (parseHub writes it): a line a firmware
-#define INSTALLS_DIR DATA_DIR "/installs"  // a record of each install
+#define HUB_LIST DATA_DIR "/hub.txt"         // the list as the board needs it (parseHub writes it): a line a firmware
+#define INSTALLS_DIR DATA_DIR "/installs"    // a record of each install
+#define SYNC_RECORD DATA_DIR "/sync.txt"     // the files a sync wrote (syncplan.h)
+#define SYNC_PLAN DATA_DIR "/sync-plan.txt"  // what the last sync set out to do
 
 // a whole firmware: the one opened, the one being saved or installed
 struct Firmware {
@@ -29,8 +33,11 @@ struct Firmware {
   std::vector<std::string> kinds;  // "synth", "groove", "drums", ...
   uint32_t size = 0;
   bool beta = false, stock = false, keyboard = false, mouse = false;
-  bool onSd = false;  // a Hub firmware that is in /fm1 too
-  bool hub = false;   // on the SD card: its details came from the Hub's list
+  std::string chip;                                        // "old", "new", "any" or "": the chip the package is for
+  std::vector<std::string> devices;                        // "fm1", "smk37": what the Hub says it is for
+  bool chipOld = false, forFm1 = false, forSmk37 = false;  // from a Hub list line (see FwItem)
+  bool onSd = false;                                       // a Hub firmware that is in /fm1 too
+  bool hub = false;                                        // on the SD card: its details came from the Hub's list
 };
 
 // a firmware in a list: what its row shows. Its strings are in the list's text
@@ -38,7 +45,10 @@ struct FwItem {
   enum : uint8_t { BETA = 1,
                    STOCK = 2,
                    ON_SD = 4,
-                   FROM_HUB = 8 };
+                   FROM_HUB = 8,
+                   CHIP_OLD = 16,  // chip: old
+                   FOR_FM1 = 32,
+                   FOR_SMK37 = 64 };
   static const uint32_t NO_LINE = 0xFFFFFFFF;
   uint32_t name, author, version, date, file, product, sha256;  // sha256: "" until it's known
   uint32_t line;                                                // where its line is in HUB_LIST (the Hub's; an SD file the Hub knows: that one's), or NO_LINE
@@ -109,6 +119,9 @@ std::string stem(const std::string& file);
 // the Hub's firmware that SD card firmware i is a version of: the very file, else the same device ID and the same name
 // (stem); -1 if none
 int hubVersionOf(const FwList& hub, const FwList& sd, size_t i);
+// the same for a firmware, with the Hub's list read from the SD card one entry at a time (no list in memory: for
+// keepHub off). m gives the answer (HubMatch for the firmware); false if there is no Hub list on the card
+bool matchHub(syncplan::HubMatch& m);
 // the device a package is for, from its own header ("FM-1_974"), "" if it isn't a package
 std::string product(const char* path);
 }  // namespace catalog

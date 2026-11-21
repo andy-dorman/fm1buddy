@@ -35,6 +35,7 @@ enum Kind { NONE,
             IDENTIFY,       // the FM-1's chip, through its boot loader, and back (uboot::lastChip)
             CHECK_UPDATE,   // fm1buddy's newest release, from the installer page (updateTag)
             FW_UPDATE,      // a firmware on the SD card replaced by its newer one from the Hub
+            SYNC,           // /fm1 brought up to date with the Hub: what the sync plan says (syncplan.h)
             UPDATE };       // fm1buddy's newest release onto this board (then it restarts)
 enum Step { IDLE,
             JOINING,
@@ -93,6 +94,11 @@ extern std::atomic<int> kind, step;
 extern std::atomic<bool> running;
 extern std::atomic<uint32_t> finished;     // counts the jobs that have ended
 extern std::atomic<uint32_t> done, total;  // bytes, while FETCHING and WRITING
+// SYNC: where it is (syncAt of syncOf actions of the plan: 0 while the Hub's list comes), the firmware it is on (done and
+// total are that file's bytes), and what it has done so far
+extern std::atomic<uint32_t> syncAt, syncOf;
+extern char syncName[48];
+extern std::atomic<uint32_t> syncNew, syncUpdated, syncUnchanged, syncRemoved, syncFailed;
 // once it has finished
 extern bool ok;
 extern std::string error;
@@ -104,7 +110,8 @@ extern sounds::Speaks speaks;  // PROBE
 extern std::string saved;      // VOICE: the file it went into; KEEP: the setup; EXPORT: what it did; BACKUP, RECOVER: its
                                // backup's file; SLOOP_BACKUP: the backup; SLOOP_RESTORE: the backup made first; SLOOP_SONG: the
                                // song file; SLOOP_SONG_IN: the song saved first; DOWNLOAD, INSTALL, FW_UPDATE: its file
-                               // in /fm1 (another name, if the Hub's was another firmware's on the SD card)
+                               // in /fm1 (another name, if the Hub's was another firmware's on the SD card); SYNC: a
+                               // line for each report of an extra source (Shrub, the sampler): not found, skipped, failed
 
 bool hubList(bool asked = true);  // asked: the user did (else it's automatic, and doesn't pause Bluetooth MIDI)
 // a job the user asked for needed Wi-Fi, so Bluetooth MIDI paused (once, for a message)
@@ -115,6 +122,11 @@ bool join(const char* ssid, const char* pass);
 bool install(const Firmware& f);
 // newer, from the Hub, into /fm1 in place of the file old (a .part until it's checked: old stays if it fails)
 bool updateFirmware(const Firmware& newer, const std::string& old);
+// /fm1 brought up to date with the Hub's list: what a sync does is in the sync plan, and what it wrote in the sync
+// record. It pauses Bluetooth MIDI (the user asked for it)
+bool sync();
+// SYNC: stop. The file it is on finishes first (checked, or removed if it fails): it starts no other
+void cancel();
 bool probe(int d);
 bool send(int d, const std::string& file);  // in /syx
 bool voice(int d);

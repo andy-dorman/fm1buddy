@@ -17,6 +17,7 @@
 #include "fm1.h"
 #include "hal.h"
 #include "memory.h"
+#include "syncplan.h"
 
 FwList catalog::hub, catalog::sd;
 std::string catalog::hubUpdated;
@@ -109,6 +110,15 @@ static void readEntry(JsonObjectConst e, Firmware& f) {
   f.stock = e["stock"] | false;
   f.keyboard = e["hid"]["keyboard"] | false;
   f.mouse = e["hid"]["mouse"] | false;
+  f.chip = e["chip"] | "";
+  JsonVariantConst d = e["devices"];
+  if (d.is<const char*>()) {
+    f.devices.push_back(d.as<const char*>());
+  } else {
+    for (JsonVariantConst v : d.as<JsonArrayConst>()) {
+      f.devices.push_back(v | "");
+    }
+  }
   JsonVariantConst k = e["kind"];
   if (k.is<const char*>()) {
     f.kinds.push_back(k.as<const char*>());
@@ -170,10 +180,11 @@ static void roomy(FwList& l) {
 }
 
 // ------------------------------------------------------------------------------------------ HUB_LIST ---
-// the list as the board needs it: a line "fm1buddy hub 1" and when the list was made, then a line a firmware, its
-// fields between tabs: name author version date what pkg file product sha256 size flags(b s k m) kinds(a,b)
-static const char* const LIST_HEAD = "fm1buddy hub 1";
-#define LIST_FIELDS 12
+// the list as the board needs it: a line "fm1buddy hub 2" and when the list was made, then a line a firmware, its
+// fields between tabs: name author version date what pkg file product sha256 size flags(b s k m) kinds(a,b) chip
+// devices(fm1,smk37). Its line format is in syncplan.h
+static const char* const LIST_HEAD = HUB_LIST_HEAD;
+#define LIST_FIELDS HUB_LIST_FIELDS
 
 static void field(FILE* f, const std::string& v, char end = '\t') {
   for (char c : v) {
@@ -192,37 +203,17 @@ static void writeLine(FILE* f, const Firmware& e) {
   for (const std::string& k : e.kinds) {
     kinds += (kinds.empty() ? "" : ",") + k;
   }
-  field(f, kinds, '\n');
+  field(f, kinds);
+  field(f, e.chip);
+  std::string devices;
+  for (const std::string& d : e.devices) {
+    devices += (devices.empty() ? "" : ",") + d;
+  }
+  field(f, devices, '\n');
 }
 
-// a line of f into line (without its '\n'): false at the end
-static bool readLine(FILE* f, std::string& line) {
-  line.clear();
-  char buf[512];
-  while (fgets(buf, sizeof buf, f)) {
-    size_t n = strlen(buf);
-    if (n && buf[n - 1] == '\n') {
-      line.append(buf, n - 1);
-      return true;
-    }
-    line.append(buf, n);
-  }
-  return !line.empty();
-}
-
-// line's fields between tabs (line is cut at them)
-static int split(std::string& line, const char* v[], int max) {
-  int n = 0;
-  char* p = &line[0];
-  v[n++] = p;
-  for (; *p && n < max; p++) {
-    if (*p == '\t') {
-      *p = 0;
-      v[n++] = p + 1;
-    }
-  }
-  return n;
-}
+using syncplan::readLine;
+using syncplan::split;
 
 bool catalog::keepHub = true;
 
@@ -267,7 +258,9 @@ static bool addLine(std::string& line, uint32_t here, FwList& list) {
   it.sha256 = list.add(v[8], strlen(v[8]));
   it.line = here;
   it.size = strtoul(v[9], 0, 10);
-  it.flags = (strchr(v[10], 'b') ? FwItem::BETA : 0) | (strchr(v[10], 's') ? FwItem::STOCK : 0);
+  it.flags = (strchr(v[10], 'b') ? FwItem::BETA : 0) | (strchr(v[10], 's') ? FwItem::STOCK : 0) |
+             (!strcmp(v[12], "old") ? FwItem::CHIP_OLD : 0) | (syncplan::forFm1(v[13], v[7]) ? FwItem::FOR_FM1 : 0) |
+             (syncplan::forSmk37(v[13], v[7]) ? FwItem::FOR_SMK37 : 0);
   for (const char* k = v[11]; *k;) {
     const char* c = strchr(k, ',');
     size_t n = c ? c - k : strlen(k);
@@ -396,7 +389,7 @@ static bool usable(const Firmware& f) {
 static int hubToLines(JsonFile& in, FILE* out, std::string& updated) {
   JsonDocument fwFilter, stockFilter, skip, all;
   for (const char* k : {"name", "author", "version", "date", "what", "pkg", "file", "product", "sha256", "size",
-                        "beta", "stock", "hid", "kind"}) {
+                        "beta", "stock", "hid", "kind", "chip", "devices"}) {
     fwFilter[k] = true;
   }
   for (const char* k : {"pkg", "product", "sha256", "size"}) {
@@ -599,6 +592,9 @@ Firmware catalog::details(const FwList& l, size_t i) {
   f.stock = it.flags & FwItem::STOCK;
   f.onSd = it.flags & FwItem::ON_SD;
   f.hub = it.flags & FwItem::FROM_HUB;
+  f.chipOld = it.flags & FwItem::CHIP_OLD;
+  f.forFm1 = it.flags & FwItem::FOR_FM1;
+  f.forSmk37 = it.flags & FwItem::FOR_SMK37;
   if (&l == &hub && f.onSd) {  // the copy on the SD card: where it is in /fm1 (a folder, say)
     for (const FwItem& x : sd.items) {
       if ((x.flags & FwItem::FROM_HUB && x.line == it.line) || (*l.str(it.sha256) && !strcasecmp(sd.str(x.sha256), l.str(it.sha256)))) {
@@ -859,6 +855,7 @@ static void hashTask(void*) {
   for (const SdFile& p : pkgs.list) {
     const char* name = pkgs.names.c_str() + p.name;
     std::string full = dir + "/" + name, key = cacheKey(name, p.size, p.mtime), sha, prod;
+    hal::idle();  // (many files to read, one after the other: the idle task runs, or the watchdog restarts the board)
     if (!cached(key, cache, sha, prod)) {
       if (sha.empty()) {
         char hex[65];
@@ -903,21 +900,7 @@ bool catalog::sdHashed() {
 }
 
 std::string catalog::stem(const std::string& file) {
-  std::string s;
-  for (char c : baseName(file)) {
-    s += (char)tolower((unsigned char)c);
-  }
-  if (s.size() > 5 && !s.compare(s.size() - 5, 5, ".fwsc")) {
-    s.resize(s.size() - 5);
-  }
-  // up to a separator followed by a number ("-2.4.4", "_v1.2")
-  for (size_t k = 1; k + 1 < s.size(); k++) {
-    char n = s[k + 1] == 'v' && k + 2 < s.size() ? s[k + 2] : s[k + 1];
-    if (strchr("-_. ", s[k]) && isdigit((unsigned char)n)) {
-      return s.substr(0, k);
-    }
-  }
-  return s;
+  return syncplan::stem(file);
 }
 
 int catalog::hubVersionOf(const FwList& hub, const FwList& sd, size_t i) {
@@ -950,6 +933,15 @@ int catalog::hubVersionOf(const FwList& hub, const FwList& sd, size_t i) {
     }
   }
   return same;  // (not "the only one for that device": a device ID is shared by other firmwares, issue #88)
+}
+
+bool catalog::matchHub(syncplan::HubMatch& m) {
+  return eachHub([](const FwList& one, void* arg) {
+    const FwItem& x = one[0];
+    ((syncplan::HubMatch*)arg)->entry(one.str(x.file), one.str(x.product), one.str(x.sha256), one.str(x.date), x.line, x.size);
+    return true;
+  },
+                 &m);
 }
 
 void catalog::scanSd() {
